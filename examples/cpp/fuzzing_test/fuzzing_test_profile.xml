@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<dds>
+    <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+        
+        <!-- Fuzzer Node 配置 -->
+        <participant profile_name="fuzzer_participant">
+            <rtps>
+                <name>FuzzerNode</name>
+                <builtin>
+                    <discovery_config>
+                        <leaseDuration>
+                            <sec>10</sec>
+                        </leaseDuration>
+                    </discovery_config>
+                </builtin>
+            </rtps>
+        </participant>
+
+        <!-- Monitor Node 配置 -->
+        <participant profile_name="monitor_participant">
+            <rtps>
+                <name>MonitorNode</name>
+                <builtin>
+                    <discovery_config>
+                        <leaseDuration>
+                            <sec>10</sec>
+                        </leaseDuration>
+                    </discovery_config>
+                </builtin>
+            </rtps>
+        </participant>
+
+        <!-- DataWriter 配置（用于 Fuzzer）-->
+        <data_writer profile_name="fuzzer_writer">
+            <qos>
+                <reliability>
+                    <kind>RELIABLE</kind>
+                </reliability>
+                <durability>
+                    <kind>TRANSIENT_LOCAL</kind>
+                </durability>
+                <history>
+                    <kind>KEEP_ALL</kind>
+                </history>
+                <!-- 增大资源限制以支持大消息 -->
+                <resource_limits>
+                    <max_samples>1000</max_samples>
+                    <max_instances>10</max_instances>
+                    <max_samples_per_instance>1000</max_samples_per_instance>
+                </resource_limits>
+            </qos>
+        </data_writer>
+
+        <!-- DataReader 配置（用于 Monitor）-->
+        <data_reader profile_name="monitor_reader">
+            <qos>
+                <reliability>
+                    <kind>RELIABLE</kind>
+                </reliability>
+                <durability>
+                    <kind>TRANSIENT_LOCAL</kind>
+                </durability>
+                <history>
+                    <kind>KEEP_ALL</kind>
+                </history>
+                <resource_limits>
+                    <max_samples>1000</max_samples>
+                    <max_instances>10</max_instances>
+                    <max_samples_per_instance>1000</max_samples_per_instance>
+                </resource_limits>
+            </qos>
+        </data_reader>
+
+        <!-- Transport 配置 - UDP 和 Shared Memory -->
+        <transport_descriptors>
+            <transport_descriptor>
+                <transport_id>UDPv4Transport</transport_id>
+                <type>UDPv4</type>
+            </transport_descriptor>
+            <transport_descriptor>
+                <transport_id>SHMTransport</transport_id>
+                <type>SHM</type>
+            </transport_descriptor>
+        </transport_descriptors>
+
+    </profiles>
+</dds>
+

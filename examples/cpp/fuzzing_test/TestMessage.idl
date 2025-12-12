@@ -1,0 +1,39 @@
+// 测试消息定义 - 用于 DDS 模糊测试
+
+// 简单测试消息
+@extensibility(APPENDABLE)
+struct SimpleTestMessage
+{
+    unsigned long seq_num;
+    string message;
+    octet data_type;
+};
+
+// 复杂嵌套消息 - 用于深度测试
+@extensibility(APPENDABLE)
+struct NestedData
+{
+    long id;
+    sequence<octet> payload;
+    double timestamp;
+};
+
+@extensibility(APPENDABLE)
+struct ComplexTestMessage
+{
+    unsigned long seq_num;
+    sequence<NestedData> nested_array;
+    string metadata;
+    sequence<long> integer_array;
+};
+
+// 边界测试消息
+@extensibility(APPENDABLE)
+struct BoundaryTestMessage
+{
+    unsigned long seq_num;
+    sequence<octet, 1024> fixed_buffer;
+    string unbounded_string;
+    long long large_number;
+};
+

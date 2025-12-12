@@ -1,0 +1,31 @@
+# 构建目录
+build/
+build_*/
+
+# 日志文件
+*.log
+*.out
+
+# PID 文件
+.pids/
+
+# IDL 生成的文件（如果在本地重新生成）
+*PubSubTypes.cxx
+*PubSubTypes.hpp
+*PubSubTypes.h
+*CdrAux.hpp
+*CdrAux.ipp
+*TypeObjectSupport.cxx
+*TypeObjectSupport.hpp
+
+# 临时文件
+*.swp
+*.swo
+*~
+
+# 编译产物
+*.o
+*.a
+*.so
+*.dylib
+

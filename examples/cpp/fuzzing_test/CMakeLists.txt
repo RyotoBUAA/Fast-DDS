@@ -145,8 +145,137 @@ if((ENABLE_ASAN AND ENABLE_UBSAN) OR CMAKE_BUILD_TYPE STREQUAL "FULL_SANITIZE")
 endif()
 target_link_libraries(monitor_node_full ${FASTDDS_LIB})
 
-# Installation
-install(TARGETS fuzzer_node monitor_node_asan monitor_node_ubsan monitor_node_full
+# ============================================================================
+# 高级模糊测试节点 (协议感知模糊测试)
+# ============================================================================
+add_executable(advanced_fuzzer_node
+    ${FUZZING_TEST_SOURCES_CXX}
+    AdvancedFuzzerNode.cpp
+    Common.cpp
+)
+target_compile_definitions(advanced_fuzzer_node PRIVATE
+    $<$<AND:$<NOT:$<BOOL:${WIN32}>>,$<STREQUAL:"${CMAKE_BUILD_TYPE}","Debug">>:__DEBUG>
+    NODE_TYPE_ADVANCED_FUZZER
+)
+target_compile_features(advanced_fuzzer_node PRIVATE cxx_std_14)
+target_link_libraries(advanced_fuzzer_node ${FASTDDS_LIB})
+
+# ============================================================================
+# libFuzzer 集成 (覆盖率引导模糊测试)
+# ============================================================================
+option(ENABLE_LIBFUZZER "Enable libFuzzer coverage-guided fuzzing" OFF)
+
+if(ENABLE_LIBFUZZER)
+    message(STATUS "Building libFuzzer harness...")
+    
+    add_executable(libfuzzer_harness
+        ${FUZZING_TEST_SOURCES_CXX}
+        LibFuzzerHarness.cpp
+    )
+    target_compile_definitions(libfuzzer_harness PRIVATE
+        $<$<AND:$<NOT:$<BOOL:${WIN32}>>,$<STREQUAL:"${CMAKE_BUILD_TYPE}","Debug">>:__DEBUG>
+    )
+    target_compile_options(libfuzzer_harness PRIVATE
+        -g
+        -fsanitize=fuzzer,address,undefined
+        -fno-omit-frame-pointer
+    )
+    target_link_options(libfuzzer_harness PRIVATE
+        -fsanitize=fuzzer,address,undefined
+    )
+    target_compile_features(libfuzzer_harness PRIVATE cxx_std_14)
+    target_link_libraries(libfuzzer_harness ${FASTDDS_LIB})
+    
+    # 安装 libFuzzer 目标
+    install(TARGETS libfuzzer_harness
+        RUNTIME DESTINATION ${DATA_INSTALL_DIR}/fastdds/examples/cpp/fuzzing_test/${BIN_INSTALL_DIR})
+endif()
+
+# ============================================================================
+# AFL++ Harness
+# ============================================================================
+option(ENABLE_AFL "Enable AFL++ harness" OFF)
+
+if(ENABLE_AFL)
+    message(STATUS "Building AFL++ harness...")
+    
+    add_executable(afl_harness
+        ${FUZZING_TEST_SOURCES_CXX}
+        AFLHarness.cpp
+    )
+    target_compile_definitions(afl_harness PRIVATE
+        $<$<AND:$<NOT:$<BOOL:${WIN32}>>,$<STREQUAL:"${CMAKE_BUILD_TYPE}","Debug">>:__DEBUG>
+    )
+    # AFL++ 编译器会自动添加必要的插桩
+    target_compile_options(afl_harness PRIVATE
+        -g
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer
+    )
+    target_link_options(afl_harness PRIVATE
+        -fsanitize=address,undefined
+    )
+    target_compile_features(afl_harness PRIVATE cxx_std_14)
+    target_link_libraries(afl_harness ${FASTDDS_LIB})
+    
+    install(TARGETS afl_harness
+        RUNTIME DESTINATION ${DATA_INSTALL_DIR}/fastdds/examples/cpp/fuzzing_test/${BIN_INSTALL_DIR})
+endif()
+
+# ============================================================================
+# CDR 专用 Fuzzer (测试序列化/反序列化)
+# ============================================================================
+option(ENABLE_CDR_FUZZER "Enable CDR serialization fuzzer" OFF)
+
+if(ENABLE_CDR_FUZZER AND ENABLE_LIBFUZZER)
+    message(STATUS "Building CDR fuzzer...")
+    
+    add_executable(cdr_fuzzer
+        ${FUZZING_TEST_SOURCES_CXX}
+        LibFuzzerHarness.cpp
+    )
+    target_compile_definitions(cdr_fuzzer PRIVATE
+        $<$<AND:$<NOT:$<BOOL:${WIN32}>>,$<STREQUAL:"${CMAKE_BUILD_TYPE}","Debug">>:__DEBUG>
+        FUZZ_TARGET_CDR_ONLY
+    )
+    target_compile_options(cdr_fuzzer PRIVATE
+        -g
+        -fsanitize=fuzzer,address,undefined
+        -fno-omit-frame-pointer
+    )
+    target_link_options(cdr_fuzzer PRIVATE
+        -fsanitize=fuzzer,address,undefined
+    )
+    target_compile_features(cdr_fuzzer PRIVATE cxx_std_14)
+    target_link_libraries(cdr_fuzzer ${FASTDDS_LIB})
+endif()
+
+# ============================================================================
+# 网络注入模糊测试器
+# ============================================================================
+add_executable(network_injector_fuzzer
+    ${FUZZING_TEST_SOURCES_CXX}
+    AdvancedFuzzerNode.cpp
+    Common.cpp
+)
+target_compile_definitions(network_injector_fuzzer PRIVATE
+    $<$<AND:$<NOT:$<BOOL:${WIN32}>>,$<STREQUAL:"${CMAKE_BUILD_TYPE}","Debug">>:__DEBUG>
+    NODE_TYPE_NETWORK_INJECTOR
+    USE_NETWORK_INJECTION
+)
+target_compile_features(network_injector_fuzzer PRIVATE cxx_std_14)
+target_link_libraries(network_injector_fuzzer ${FASTDDS_LIB})
+
+# ============================================================================
+# 安装目标
+# ============================================================================
+install(TARGETS 
+    fuzzer_node 
+    monitor_node_asan 
+    monitor_node_ubsan 
+    monitor_node_full
+    advanced_fuzzer_node
+    network_injector_fuzzer
     RUNTIME DESTINATION ${DATA_INSTALL_DIR}/fastdds/examples/cpp/fuzzing_test/${BIN_INSTALL_DIR})
 
 # Copy XML configuration files
@@ -160,4 +289,38 @@ foreach(XML_FILE_COMPLETE_PATH ${XML_FILES})
     install(FILES ${XML_FILE_COMPLETE_PATH}
         DESTINATION ${DATA_INSTALL_DIR}/fastdds/examples/cpp/fuzzing_test/${BIN_INSTALL_DIR})
 endforeach()
+
+# ============================================================================
+# 复制种子和字典文件
+# ============================================================================
+file(GLOB SEED_FILES ${CMAKE_CURRENT_SOURCE_DIR}/seeds/*.bin)
+file(GLOB DICT_FILES ${CMAKE_CURRENT_SOURCE_DIR}/dictionaries/*.dict)
+
+# 创建输出目录
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/seeds)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/dictionaries)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/crashes)
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/corpus)
+
+foreach(SEED_FILE ${SEED_FILES})
+    get_filename_component(SEED_NAME ${SEED_FILE} NAME)
+    configure_file(${SEED_FILE} ${CMAKE_CURRENT_BINARY_DIR}/seeds/${SEED_NAME} COPYONLY)
+endforeach()
+
+foreach(DICT_FILE ${DICT_FILES})
+    get_filename_component(DICT_NAME ${DICT_FILE} NAME)
+    configure_file(${DICT_FILE} ${CMAKE_CURRENT_BINARY_DIR}/dictionaries/${DICT_NAME} COPYONLY)
+endforeach()
+
+# ============================================================================
+# 打印配置摘要
+# ============================================================================
+message(STATUS "")
+message(STATUS "=== Fuzzing Test Configuration ===")
+message(STATUS "  ASAN:       ${ENABLE_ASAN}")
+message(STATUS "  UBSAN:      ${ENABLE_UBSAN}")
+message(STATUS "  libFuzzer:  ${ENABLE_LIBFUZZER}")
+message(STATUS "  AFL++:      ${ENABLE_AFL}")
+message(STATUS "  CDR Fuzzer: ${ENABLE_CDR_FUZZER}")
+message(STATUS "==================================")
 

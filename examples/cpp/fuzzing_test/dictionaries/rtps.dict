@@ -1,0 +1,190 @@
+# RTPS 协议模糊测试字典
+# 用于 AFL++ 和 libFuzzer
+
+# ==========================================
+# RTPS 魔术数字
+# ==========================================
+"RTPS"
+
+# ==========================================
+# 协议版本
+# ==========================================
+"\x02\x01"                   # RTPS 2.1
+"\x02\x02"                   # RTPS 2.2
+"\x02\x03"                   # RTPS 2.3
+"\x02\x04"                   # RTPS 2.4
+"\x00\x00"                   # 无效版本
+"\xff\xff"                   # 最大版本
+
+# ==========================================
+# Vendor IDs (2 bytes)
+# ==========================================
+"\x00\x00"                   # 未知
+"\x01\x01"                   # RTI
+"\x01\x02"                   # PrismTech
+"\x01\x03"                   # OCI
+"\x01\x0f"                   # eProsima
+"\x01\x10"                   # ADLINK
+"\x01\x12"                   # CycloneDDS
+
+# ==========================================
+# Submessage IDs (1 byte)
+# ==========================================
+"\x01"                       # PAD
+"\x06"                       # ACKNACK
+"\x07"                       # HEARTBEAT
+"\x08"                       # GAP
+"\x09"                       # INFO_TS
+"\x0c"                       # INFO_SRC
+"\x0d"                       # INFO_REPLY_IP4
+"\x0e"                       # INFO_DST
+"\x0f"                       # INFO_REPLY
+"\x12"                       # NACK_FRAG
+"\x13"                       # HEARTBEAT_FRAG
+"\x15"                       # DATA
+"\x16"                       # DATA_FRAG
+
+# 安全扩展 submessage IDs
+"\x30"                       # SEC_BODY
+"\x31"                       # SEC_PREFIX
+"\x32"                       # SEC_POSTFIX
+"\x33"                       # SRTPS_PREFIX
+"\x34"                       # SRTPS_POSTFIX
+
+# ==========================================
+# Submessage Flags
+# ==========================================
+"\x00"                       # 无标志
+"\x01"                       # E (Endianness) - Little Endian
+"\x02"                       # I (Invalidate)
+"\x03"                       # E + I
+"\x04"                       # D (Data present)
+"\x05"                       # E + D
+"\x07"                       # E + Q + D (DATA with inline QoS)
+"\x0c"                       # Q + K (Key)
+"\x0d"                       # E + Q + K
+
+# ==========================================
+# Entity Kinds (1 byte)
+# ==========================================
+"\x00"                       # ENTITY_KIND_USER_UNKNOWN
+"\x01"                       # ENTITY_KIND_USER_WRITER_WITH_KEY
+"\x02"                       # ENTITY_KIND_USER_WRITER_NO_KEY
+"\x03"                       # ENTITY_KIND_USER_READER_NO_KEY
+"\x04"                       # ENTITY_KIND_USER_READER_WITH_KEY
+"\xc0"                       # ENTITY_KIND_BUILTIN_UNKNOWN
+"\xc1"                       # ENTITY_KIND_BUILTIN_PARTICIPANT
+"\xc2"                       # ENTITY_KIND_BUILTIN_WRITER_WITH_KEY
+"\xc3"                       # ENTITY_KIND_BUILTIN_WRITER_NO_KEY
+"\xc4"                       # ENTITY_KIND_BUILTIN_READER_NO_KEY
+"\xc7"                       # ENTITY_KIND_BUILTIN_READER_WITH_KEY
+
+# ==========================================
+# 特殊 EntityId 值
+# ==========================================
+"\x00\x00\x00\x00"           # ENTITYID_UNKNOWN
+"\x00\x00\x01\xc1"           # ENTITYID_PARTICIPANT
+"\x00\x00\x02\xc2"           # ENTITYID_SEDP_BUILTIN_TOPIC_WRITER
+"\x00\x00\x02\xc7"           # ENTITYID_SEDP_BUILTIN_TOPIC_READER
+"\x00\x00\x03\xc2"           # ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER
+"\x00\x00\x03\xc7"           # ENTITYID_SEDP_BUILTIN_PUBLICATIONS_READER
+"\x00\x00\x04\xc2"           # ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER
+"\x00\x00\x04\xc7"           # ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_READER
+"\x00\x01\x00\xc2"           # ENTITYID_SPDP_BUILTIN_PARTICIPANT_WRITER
+"\x00\x01\x00\xc7"           # ENTITYID_SPDP_BUILTIN_PARTICIPANT_READER
+"\x00\x02\x00\xc2"           # ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER
+"\x00\x02\x00\xc7"           # ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_READER
+
+# ==========================================
+# Parameter IDs (2 bytes, little endian)
+# ==========================================
+"\x01\x00"                   # PID_SENTINEL
+"\x02\x00"                   # PID_PAD
+"\x50\x00"                   # PID_PARTICIPANT_GUID
+"\x58\x00"                   # PID_METATRAFFIC_UNICAST_LOCATOR
+"\x32\x00"                   # PID_METATRAFFIC_MULTICAST_LOCATOR
+"\x31\x00"                   # PID_DEFAULT_UNICAST_LOCATOR
+"\x48\x00"                   # PID_DEFAULT_MULTICAST_LOCATOR
+"\x15\x00"                   # PID_PROTOCOL_VERSION
+"\x16\x00"                   # PID_VENDORID
+"\x1a\x00"                   # PID_RELIABILITY
+"\x1d\x00"                   # PID_LIVELINESS
+"\x1b\x00"                   # PID_DURABILITY
+"\x23\x00"                   # PID_DEADLINE
+"\x27\x00"                   # PID_LATENCY_BUDGET
+"\x40\x00"                   # PID_OWNERSHIP
+"\x41\x00"                   # PID_OWNERSHIP_STRENGTH
+"\x43\x00"                   # PID_PRESENTATION
+"\x44\x00"                   # PID_DESTINATION_ORDER
+"\x49\x00"                   # PID_LIFESPAN
+"\x59\x00"                   # PID_BUILTIN_ENDPOINT_SET
+"\x62\x00"                   # PID_BUILTIN_ENDPOINT_QOS
+"\x05\x00"                   # PID_TOPIC_NAME
+"\x07\x00"                   # PID_TYPE_NAME
+"\x2b\x00"                   # PID_PARTITION
+"\x2c\x00"                   # PID_GROUP_DATA
+"\x2d\x00"                   # PID_TOPIC_DATA
+"\x2e\x00"                   # PID_USER_DATA
+
+# ==========================================
+# Locator kinds (4 bytes, little endian)
+# ==========================================
+"\x00\x00\x00\x00"           # LOCATOR_KIND_INVALID
+"\x01\x00\x00\x00"           # LOCATOR_KIND_UDPv4
+"\x02\x00\x00\x00"           # LOCATOR_KIND_UDPv6
+"\x10\x00\x00\x00"           # LOCATOR_KIND_TCPv4
+"\x20\x00\x00\x00"           # LOCATOR_KIND_TCPv6
+"\x01\x01\x00\x00"           # LOCATOR_KIND_SHM
+
+# ==========================================
+# 边界值测试
+# ==========================================
+# 序列号
+"\x00\x00\x00\x00\x00\x00\x00\x00"  # 序列号 0
+"\x01\x00\x00\x00\x00\x00\x00\x00"  # 序列号 1
+"\xff\xff\xff\x7f\xff\xff\xff\xff"  # 最大正序列号
+"\x00\x00\x00\x80\x00\x00\x00\x00"  # 最小负高位
+
+# 长度字段
+"\x00\x00"                   # 长度 0
+"\x01\x00"                   # 长度 1
+"\x04\x00"                   # 长度 4 (对齐)
+"\xff\x7f"                   # 接近最大
+"\xff\xff"                   # 最大值
+
+# ==========================================
+# 时间戳
+# ==========================================
+"\xff\xff\xff\x7f\xff\xff\xff\xff"  # TIME_INFINITE
+"\x00\x00\x00\x00\x00\x00\x00\x00"  # TIME_ZERO
+
+# ==========================================
+# 常见攻击模式
+# ==========================================
+"AAAAAAAAAAAAAAAA"           # 重复字符
+"\x00\x00\x00\x00\x00\x00\x00\x00" # 空字节序列
+"\xff\xff\xff\xff\xff\xff\xff\xff" # 全1字节序列
+
+# ==========================================
+# 格式字符串 (安全测试)
+# ==========================================
+"%s%s%s%s"
+"%n%n%n%n"
+"%x%x%x%x"
+"%p%p%p%p"
+
+# ==========================================
+# CDR 编码特殊值
+# ==========================================
+"\x00\x01"                   # CDR_BE (big endian)
+"\x01\x00"                   # CDR_LE (little endian)
+"\x00\x02"                   # PL_CDR_BE
+"\x02\x00"                   # PL_CDR_LE
+
+# ==========================================
+# DDS 安全扩展
+# ==========================================
+"\x00\x80"                   # DDS_SEC_PREFIX
+"\x01\x80"                   # DDS_SEC_POSTFIX
+"\x02\x80"                   # DDS_SEC_BODY
+

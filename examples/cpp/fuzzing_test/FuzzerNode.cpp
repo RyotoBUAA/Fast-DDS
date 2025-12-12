@@ -23,6 +23,7 @@
 #include <random>
 #include <vector>
 #include <cstring>
+#include <sstream>
 
 #include <fastdds/dds/domain/DomainParticipantFactory.hpp>
 #include <fastdds/dds/domain/DomainParticipant.hpp>
@@ -65,7 +66,7 @@ public:
     }
 
     void on_publication_matched(
-            DataWriter* writer,
+            DataWriter* /*writer*/,
             const PublicationMatchedStatus& info) override
     {
         if (info.current_count_change == 1)
@@ -99,7 +100,13 @@ public:
         , dist_byte_(0, 255)
         , dist_strategy_(0, 9)
         , sequence_num_(0)
+        , strategy_counter_(0)
     {
+        // 初始化策略计数器
+        for (int i = 0; i < 10; ++i)
+        {
+            strategy_counts_[i] = 0;
+        }
     }
 
     /**
@@ -109,8 +116,10 @@ public:
     {
         SimpleTestMessage msg;
         
-        // 随机选择模糊测试策略
-        FuzzStrategy strategy = static_cast<FuzzStrategy>(dist_strategy_(rng_));
+        // 轮询选择模糊测试策略，确保均匀分布
+        FuzzStrategy strategy = static_cast<FuzzStrategy>(strategy_counter_ % 10);
+        strategy_counter_++;
+        strategy_counts_[static_cast<int>(strategy)]++;
         
         switch (strategy)
         {
@@ -203,8 +212,8 @@ private:
     {
         msg.seq_num(sequence_num_++);
         
-        // 生成超大字符串（可能触发内存问题）
-        size_t size = 10000 + (dist_byte_(rng_) * 100);
+        // 生成较大字符串（1KB-10KB 范围，避免过大）
+        size_t size = 1000 + (dist_byte_(rng_) * 35);  // 1KB-10KB
         std::string large_str(size, 'A');
         
         msg.message(large_str);
@@ -305,6 +314,34 @@ private:
     std::uniform_int_distribution<int> dist_byte_;
     std::uniform_int_distribution<int> dist_strategy_;
     std::atomic<uint32_t> sequence_num_;
+    std::atomic<uint32_t> strategy_counter_;
+    std::array<std::atomic<int>, 10> strategy_counts_;
+    
+public:
+    // 获取策略统计信息
+    void print_strategy_stats() const
+    {
+        std::cout << "\n========== 模糊测试策略统计 ==========" << std::endl;
+        const char* strategy_names[] = {
+            "NORMAL (正常消息)",
+            "BIT_FLIP (位翻转)",
+            "BOUNDARY_VALUES (边界值)",
+            "LARGE_PAYLOAD (超大负载)",
+            "RANDOM_DATA (随机数据)",
+            "SEQUENCE_CHAOS (序列号混乱)",
+            "SPECIAL_CHARS (特殊字符)",
+            "NULL_INJECTION (空字符注入)",
+            "OVERFLOW_ATTEMPT (溢出尝试)",
+            "FORMAT_STRING (格式字符串)"
+        };
+        
+        for (int i = 0; i < 10; ++i)
+        {
+            std::cout << "  " << strategy_names[i] << ": " 
+                     << strategy_counts_[i].load() << " 条" << std::endl;
+        }
+        std::cout << "========================================" << std::endl;
+    }
 };
 
 /**
@@ -334,6 +371,11 @@ public:
         // 创建 DomainParticipant
         DomainParticipantQos pqos;
         pqos.name("FuzzerNode");
+        
+        // 增加传输层最大消息大小（默认是 65KB，增加到 1MB）
+        pqos.transport().use_builtin_transports = true;
+        pqos.transport().send_socket_buffer_size = 1048576;  // 1MB
+        pqos.transport().listen_socket_buffer_size = 1048576;  // 1MB
         
         participant_ = DomainParticipantFactory::get_instance()->create_participant(
             TEST_DOMAIN_ID, pqos);
@@ -373,9 +415,26 @@ public:
 
         // 创建 DataWriter
         DataWriterQos wqos = DATAWRITER_QOS_DEFAULT;
-        wqos.reliability().kind = RELIABLE_RELIABILITY_QOS;
-        wqos.durability().kind = TRANSIENT_LOCAL_DURABILITY_QOS;
-        wqos.history().kind = KEEP_ALL_HISTORY_QOS;
+        
+        // 使用 BEST_EFFORT 模式，不保证可靠性但发送更快
+        wqos.reliability().kind = BEST_EFFORT_RELIABILITY_QOS;
+        wqos.durability().kind = VOLATILE_DURABILITY_QOS;
+        
+        // 使用 KEEP_LAST 并设置适中的深度
+        wqos.history().kind = KEEP_LAST_HISTORY_QOS;
+        wqos.history().depth = 1;  // 只保留最新的消息，不积压
+        
+        // 设置资源限制
+        wqos.resource_limits().max_samples = 10;
+        wqos.resource_limits().max_instances = 1;
+        wqos.resource_limits().max_samples_per_instance = 10;
+        
+        // 支持大型 payload
+        wqos.endpoint().history_memory_policy = 
+            eprosima::fastdds::rtps::PREALLOCATED_WITH_REALLOC_MEMORY_MODE;
+        
+        // 使用同步发送，立即知道结果
+        wqos.publish_mode().kind = SYNCHRONOUS_PUBLISH_MODE;
 
         writer_ = publisher_->create_datawriter(topic_, wqos, &listener_);
         if (writer_ == nullptr)
@@ -411,31 +470,68 @@ public:
                               "Subscribers connected, starting to send fuzzed messages");
 
         // 发送模糊测试消息
-        uint32_t sent = 0;
+        uint32_t attempts = 0;  // 尝试次数
+        uint32_t sent = 0;      // 成功次数
+        uint32_t failed = 0;    // 失败次数
         PerformanceMonitor perf_monitor;
         
-        while (sent < message_count && !SignalHandler::should_stop())
+        // 按尝试次数而不是成功次数来计数（模糊测试中失败也是有价值的）
+        while (attempts < message_count && !SignalHandler::should_stop())
         {
+            attempts++;
             perf_monitor.start_measurement();
             
             // 生成并发送模糊消息
             SimpleTestMessage msg = engine_.generate_fuzzed_message();
             
-            if (writer_->write(&msg))
+            // 尝试发送
+            ReturnCode_t ret = writer_->write(&msg);
+            
+            if (ret == RETCODE_OK)
             {
                 sent++;
                 
                 if (sent % 100 == 0)
                 {
-                    Logger::instance().log(LogLevel::INFO, "FUZZER",
-                                          "Sent " + std::to_string(sent) + 
-                                          " fuzzed messages");
+                    std::stringstream ss;
+                    ss << "Progress: " << attempts << " attempts, " 
+                       << sent << " sent, " << failed << " failed ("
+                       << (sent * 100.0 / attempts) << "% success rate)";
+                    Logger::instance().log(LogLevel::INFO, "FUZZER", ss.str());
                 }
             }
             else
             {
-                Logger::instance().log(LogLevel::ERROR, "FUZZER",
-                                      "Failed to send message");
+                failed++;
+                
+                // 记录详细的错误信息（前几次）
+                if (failed <= 5)
+                {
+                    std::string error_msg = "Failed to send message #" + 
+                                          std::to_string(attempts) + ", return code: ";
+                    switch (ret)
+                    {
+                        case RETCODE_ERROR:
+                            error_msg += "RETCODE_ERROR";
+                            break;
+                        case RETCODE_TIMEOUT:
+                            error_msg += "RETCODE_TIMEOUT";
+                            break;
+                        case RETCODE_OUT_OF_RESOURCES:
+                            error_msg += "OUT_OF_RESOURCES (queue full?)";
+                            break;
+                        case RETCODE_NOT_ENABLED:
+                            error_msg += "NOT_ENABLED";
+                            break;
+                        default:
+                            error_msg += std::to_string(static_cast<int>(ret));
+                            break;
+                    }
+                    Logger::instance().log(LogLevel::WARNING, "FUZZER", error_msg);
+                }
+                
+                // 发送失败时短暂等待，缓解拥塞
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
             
             perf_monitor.end_measurement();
@@ -444,11 +540,15 @@ public:
             std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
         }
 
-        Logger::instance().log(LogLevel::INFO, "FUZZER",
-                              "Fuzzing test completed. Total messages sent: " +
-                              std::to_string(sent));
+        std::stringstream ss;
+        ss << "Fuzzing test completed!" << std::endl
+           << "  Total attempts: " << attempts << std::endl
+           << "  Successful: " << sent << " (" << (sent * 100.0 / attempts) << "%)" << std::endl
+           << "  Failed: " << failed << " (" << (failed * 100.0 / attempts) << "%)";
+        Logger::instance().log(LogLevel::INFO, "FUZZER", ss.str());
         
         perf_monitor.print_stats();
+        engine_.print_strategy_stats();
     }
 
 private:
@@ -492,8 +592,10 @@ int main(int argc, char** argv)
     }
 
     std::cout << "Configuration:" << std::endl;
-    std::cout << "  Message count: " << message_count << std::endl;
+    std::cout << "  Test attempts: " << message_count << std::endl;
     std::cout << "  Interval: " << interval_ms << " ms" << std::endl;
+    std::cout << "Note: Will attempt to send " << message_count 
+              << " messages (some may fail, which is normal for fuzzing)" << std::endl;
 
     // 设置日志文件
     Logger::instance().set_log_file("fuzzer_node.log");

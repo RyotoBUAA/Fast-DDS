@@ -6,6 +6,10 @@
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
+# 项目根目录（相对于 examples/cpp/fuzzing_test）
+PROJECT_ROOT="$SCRIPT_DIR/../../../"
+BUILD_DIR="$PROJECT_ROOT/build"
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -14,8 +18,8 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # 默认参数
-MESSAGE_COUNT=${1:-1000}
-INTERVAL_MS=${2:-100}
+MESSAGE_COUNT=${1:-1000}  # 1000 条消息，每种策略 100 条
+INTERVAL_MS=${2:-50}      # 发送间隔 50ms
 
 echo -e "${GREEN}=========================================${NC}"
 echo -e "${GREEN}  DDS Fuzzing Test - 启动测试${NC}"
@@ -27,17 +31,19 @@ echo "  发送间隔: ${INTERVAL_MS}ms"
 echo ""
 
 # 检查可执行文件是否存在
-if [ ! -f "build/fuzzer_node" ]; then
+if [ ! -f "$BUILD_DIR/examples/cpp/fuzzing_test/fuzzer_node" ]; then
     echo -e "${RED}错误: 找不到 fuzzer_node${NC}"
-    echo "请先运行: ./build_all.sh"
+    echo "路径: $BUILD_DIR/examples/cpp/fuzzing_test/fuzzer_node"
+    echo "请先在项目根目录构建项目"
     exit 1
 fi
 
-if [ ! -f "build_asan/monitor_node_asan" ] || \
-   [ ! -f "build_ubsan/monitor_node_ubsan" ] || \
-   [ ! -f "build_full/monitor_node_full" ]; then
+if [ ! -f "$BUILD_DIR/examples/cpp/fuzzing_test/monitor_node_asan" ] || \
+   [ ! -f "$BUILD_DIR/examples/cpp/fuzzing_test/monitor_node_ubsan" ] || \
+   [ ! -f "$BUILD_DIR/examples/cpp/fuzzing_test/monitor_node_full" ]; then
     echo -e "${RED}错误: 找不到 monitor 节点${NC}"
-    echo "请先运行: ./build_all.sh"
+    echo "路径: $BUILD_DIR/examples/cpp/fuzzing_test/"
+    echo "请先在项目根目录构建项目"
     exit 1
 fi
 
@@ -97,21 +103,21 @@ echo -e "${YELLOW}启动监控节点...${NC}"
 
 # 启动 Monitor Node 1 (ASAN)
 echo -e "${BLUE}启动 Monitor Node 1 (ASAN)...${NC}"
-./build_asan/monitor_node_asan > monitor1.out 2>&1 &
+"$BUILD_DIR/examples/cpp/fuzzing_test/monitor_node_asan" > monitor1.out 2>&1 &
 MONITOR1_PID=$!
 echo $MONITOR1_PID > .pids/monitor1.pid
 echo "  PID: $MONITOR1_PID"
 
 # 启动 Monitor Node 2 (UBSAN)
 echo -e "${BLUE}启动 Monitor Node 2 (UBSAN)...${NC}"
-./build_ubsan/monitor_node_ubsan > monitor2.out 2>&1 &
+"$BUILD_DIR/examples/cpp/fuzzing_test/monitor_node_ubsan" > monitor2.out 2>&1 &
 MONITOR2_PID=$!
 echo $MONITOR2_PID > .pids/monitor2.pid
 echo "  PID: $MONITOR2_PID"
 
 # 启动 Monitor Node 3 (ASAN+UBSAN)
 echo -e "${BLUE}启动 Monitor Node 3 (ASAN+UBSAN)...${NC}"
-./build_full/monitor_node_full > monitor3.out 2>&1 &
+"$BUILD_DIR/examples/cpp/fuzzing_test/monitor_node_full" > monitor3.out 2>&1 &
 MONITOR3_PID=$!
 echo $MONITOR3_PID > .pids/monitor3.pid
 echo "  PID: $MONITOR3_PID"
@@ -138,7 +144,7 @@ echo -e "${BLUE}启动 Fuzzer Node...${NC}"
 echo -e "${YELLOW}开始发送模糊测试消息...${NC}"
 echo ""
 
-./build/fuzzer_node $MESSAGE_COUNT $INTERVAL_MS
+"$BUILD_DIR/examples/cpp/fuzzing_test/fuzzer_node" $MESSAGE_COUNT $INTERVAL_MS
 
 echo ""
 echo -e "${GREEN}Fuzzer 完成发送${NC}"

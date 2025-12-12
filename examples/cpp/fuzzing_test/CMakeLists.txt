@@ -17,12 +17,23 @@ cmake_minimum_required(VERSION 3.20)
 project(fastdds_fuzzing_test VERSION 1 LANGUAGES CXX)
 
 # Find requirements
+# 当在 Fast-DDS 主项目中构建时，fastdds_FOUND 已经被设置
+# 当独立构建时，需要查找已安装的 fastcdr 和 fastdds
 if(NOT fastcdr_FOUND)
     find_package(fastcdr 2 REQUIRED)
 endif()
 
 if(NOT fastdds_FOUND)
     find_package(fastdds 3 REQUIRED)
+endif()
+
+# 如果在主项目中构建，使用项目内部的 fastdds 目标
+if(TARGET fastdds)
+    message(STATUS "Building fuzzing_test as part of Fast-DDS project")
+    set(FASTDDS_LIB fastdds)
+else()
+    message(STATUS "Building fuzzing_test standalone")
+    set(FASTDDS_LIB fastdds fastcdr)
 endif()
 
 # Check C++11
@@ -65,7 +76,7 @@ target_compile_definitions(fuzzer_node PRIVATE
     $<$<AND:$<NOT:$<BOOL:${WIN32}>>,$<STREQUAL:"${CMAKE_BUILD_TYPE}","Debug">>:__DEBUG>
     NODE_TYPE_FUZZER
 )
-target_link_libraries(fuzzer_node fastdds fastcdr)
+target_link_libraries(fuzzer_node ${FASTDDS_LIB})
 
 # Monitor Node 1 (启用 ASAN)
 add_executable(monitor_node_asan
@@ -87,7 +98,7 @@ if(ENABLE_ASAN OR CMAKE_BUILD_TYPE STREQUAL "ASAN")
     target_link_options(monitor_node_asan PRIVATE -fsanitize=address)
     message(STATUS "ASAN enabled for monitor_node_asan")
 endif()
-target_link_libraries(monitor_node_asan fastdds fastcdr)
+target_link_libraries(monitor_node_asan ${FASTDDS_LIB})
 
 # Monitor Node 2 (启用 UBSAN)
 add_executable(monitor_node_ubsan
@@ -109,7 +120,7 @@ if(ENABLE_UBSAN OR CMAKE_BUILD_TYPE STREQUAL "UBSAN")
     target_link_options(monitor_node_ubsan PRIVATE -fsanitize=undefined)
     message(STATUS "UBSAN enabled for monitor_node_ubsan")
 endif()
-target_link_libraries(monitor_node_ubsan fastdds fastcdr)
+target_link_libraries(monitor_node_ubsan ${FASTDDS_LIB})
 
 # Monitor Node 3 (启用 ASAN + UBSAN)
 add_executable(monitor_node_full
@@ -132,7 +143,7 @@ if((ENABLE_ASAN AND ENABLE_UBSAN) OR CMAKE_BUILD_TYPE STREQUAL "FULL_SANITIZE")
     target_link_options(monitor_node_full PRIVATE -fsanitize=address,undefined)
     message(STATUS "ASAN+UBSAN enabled for monitor_node_full")
 endif()
-target_link_libraries(monitor_node_full fastdds fastcdr)
+target_link_libraries(monitor_node_full ${FASTDDS_LIB})
 
 # Installation
 install(TARGETS fuzzer_node monitor_node_asan monitor_node_ubsan monitor_node_full

@@ -71,7 +71,7 @@ public:
         SampleInfo info;
 
         // 尝试读取简单消息
-        if (reader->take_next_sample(&simple_msg, &info) == ReturnCode_t::RETCODE_OK)
+        if (reader->take_next_sample(&simple_msg, &info) == RETCODE_OK)
         {
             if (info.valid_data)
             {
@@ -81,7 +81,7 @@ public:
     }
 
     void on_subscription_matched(
-            DataReader* reader,
+            DataReader* /*reader*/,
             const SubscriptionMatchedStatus& info) override
     {
         if (info.current_count_change == 1)
@@ -109,11 +109,12 @@ private:
         // 检测消息内容
         std::string message_str = msg.message();
         
-        // 检测可能的内存问题
-        if (message_str.size() > 10000)
+        // 检测可能的内存问题（超过 5KB 视为大消息）
+        if (message_str.size() > 5000)
         {
-            Logger::instance().log_anomaly("LARGE_MESSAGE",
-                "Message size exceeds expected bounds");
+            std::stringstream ss;
+            ss << "Message size " << message_str.size() << " bytes exceeds expected bounds";
+            Logger::instance().log_anomaly("LARGE_MESSAGE", ss.str());
             detector_.record_error();
         }
 
@@ -199,6 +200,11 @@ public:
         DomainParticipantQos pqos;
         pqos.name(node_name_);
         
+        // 增加传输层最大消息大小（默认是 65KB，增加到 1MB）
+        pqos.transport().use_builtin_transports = true;
+        pqos.transport().send_socket_buffer_size = 1048576;  // 1MB
+        pqos.transport().listen_socket_buffer_size = 1048576;  // 1MB
+        
         participant_ = DomainParticipantFactory::get_instance()->create_participant(
             TEST_DOMAIN_ID, pqos);
         
@@ -237,9 +243,23 @@ public:
 
         // 创建 DataReader
         DataReaderQos rqos = DATAREADER_QOS_DEFAULT;
-        rqos.reliability().kind = RELIABLE_RELIABILITY_QOS;
-        rqos.durability().kind = TRANSIENT_LOCAL_DURABILITY_QOS;
-        rqos.history().kind = KEEP_ALL_HISTORY_QOS;
+        
+        // 使用 BEST_EFFORT 模式，与 Publisher 匹配
+        rqos.reliability().kind = BEST_EFFORT_RELIABILITY_QOS;
+        rqos.durability().kind = VOLATILE_DURABILITY_QOS;
+        
+        // 使用 KEEP_LAST，接收端可以设置大一些
+        rqos.history().kind = KEEP_LAST_HISTORY_QOS;
+        rqos.history().depth = 50;  // 接收端缓冲更多消息
+        
+        // 设置资源限制
+        rqos.resource_limits().max_samples = 100;
+        rqos.resource_limits().max_instances = 1;
+        rqos.resource_limits().max_samples_per_instance = 100;
+        
+        // 支持大型 payload
+        rqos.endpoint().history_memory_policy = 
+            eprosima::fastdds::rtps::PREALLOCATED_WITH_REALLOC_MEMORY_MODE;
 
         reader_ = subscriber_->create_datareader(topic_, rqos, &listener_);
         if (reader_ == nullptr)
@@ -291,7 +311,7 @@ private:
 /**
  * @brief 主函数
  */
-int main(int argc, char** argv)
+int main(int /*argc*/, char** /*argv*/)
 {
     std::cout << "========================================" << std::endl;
     std::cout << "  DDS Fuzzing Test - Monitor Node " << MONITOR_ID << std::endl;

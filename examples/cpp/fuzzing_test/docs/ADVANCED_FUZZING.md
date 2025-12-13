@@ -112,16 +112,16 @@ afl-clang-fast++ --version
 cd examples/cpp/fuzzing_test
 
 # 基础构建（包含高级模糊器）
-./build_advanced.sh --basic
+./tools/build_advanced.sh --basic
 
 # 启用 libFuzzer
-./build_advanced.sh --libfuzzer
+./tools/build_advanced.sh --libfuzzer
 
 # 启用 AFL++
-./build_advanced.sh --afl
+./tools/build_advanced.sh --afl
 
 # 构建所有工具
-./build_advanced.sh --all
+./tools/build_advanced.sh --all
 ```
 
 ### 手动构建

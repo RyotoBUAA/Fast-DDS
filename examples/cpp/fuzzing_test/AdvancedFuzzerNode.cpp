@@ -165,6 +165,10 @@ public:
     
     void save_to_directory(const std::string& dir)
     {
+        // 创建目录（如果不存在）
+        std::string mkdir_cmd = "mkdir -p " + dir;
+        system(mkdir_cmd.c_str());
+        
         // 保存语料库到目录
         std::cout << "Saving corpus to: " << dir << std::endl;
         
@@ -480,7 +484,10 @@ private:
     
     void save_crash(const std::vector<uint8_t>& input)
     {
-        std::string filename = "crashes/crash_" + std::to_string(crashes_) + ".bin";
+        // 创建目录（如果不存在）
+        system("mkdir -p output/crashes");
+        
+        std::string filename = "output/crashes/crash_" + std::to_string(crashes_) + ".bin";
         std::ofstream file(filename, std::ios::binary);
         if (file) {
             file.write(reinterpret_cast<const char*>(input.data()), input.size());
@@ -491,7 +498,10 @@ private:
     
     void save_hang(const std::vector<uint8_t>& input)
     {
-        std::string filename = "hangs/hang_" + std::to_string(hangs_) + ".bin";
+        // 创建目录（如果不存在）
+        system("mkdir -p output/hangs");
+        
+        std::string filename = "output/hangs/hang_" + std::to_string(hangs_) + ".bin";
         std::ofstream file(filename, std::ios::binary);
         if (file) {
             file.write(reinterpret_cast<const char*>(input.data()), input.size());
@@ -961,10 +971,10 @@ int main(int argc, char** argv)
     std::cout << "  Injection mode: " << (use_injection ? "enabled" : "disabled") << std::endl;
     
     // 创建必要的目录
-    system("mkdir -p crashes hangs corpus");
+    system("mkdir -p output/crashes output/hangs output/corpus");
     
     // 设置日志文件
-    Logger::instance().set_log_file("advanced_fuzzer.log");
+    Logger::instance().set_log_file("output/advanced_fuzzer.log");
     
     // 设置信号处理
     SignalHandler::setup();

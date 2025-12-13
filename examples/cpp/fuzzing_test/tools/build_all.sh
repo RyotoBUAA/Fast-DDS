@@ -10,7 +10,8 @@ echo "  DDS Fuzzing Test - 构建所有版本"
 echo "========================================="
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR"
+FUZZING_TEST_DIR="$SCRIPT_DIR/.."
+cd "$FUZZING_TEST_DIR"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -70,6 +71,7 @@ echo "  - Monitor Node 2:     build_ubsan/monitor_node_ubsan"
 echo "  - Monitor Node 3:     build_full/monitor_node_full"
 echo ""
 echo "运行测试："
-echo "  ./run_test.sh"
+echo "  ./tools/run_test.sh"
 echo ""
+
 

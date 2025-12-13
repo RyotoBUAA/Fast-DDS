@@ -6,7 +6,7 @@
 
 ```bash
 cd examples/cpp/fuzzing_test
-./build_all.sh
+./tools/build_all.sh
 ```
 
 等待编译完成（可能需要几分钟）。
@@ -14,7 +14,7 @@ cd examples/cpp/fuzzing_test
 ### 2. 运行测试
 
 ```bash
-./run_test.sh
+./tools/run_test.sh
 ```
 
 这会启动所有四个节点并开始模糊测试。
@@ -40,10 +40,10 @@ grep "Statistics" *.log -A 10
 
 ```bash
 # 发送 2000 条消息，每条间隔 50ms
-./run_test.sh 2000 50
+./tools/run_test.sh 2000 50
 
 # 发送 500 条消息，每条间隔 200ms
-./run_test.sh 500 200
+./tools/run_test.sh 500 200
 ```
 
 ### 单独运行节点

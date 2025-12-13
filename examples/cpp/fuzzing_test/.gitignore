@@ -2,6 +2,10 @@
 build/
 build_*/
 
+# 输出目录（日志、崩溃、挂起等）
+output/
+!output/.gitkeep
+
 # 日志文件
 *.log
 *.out

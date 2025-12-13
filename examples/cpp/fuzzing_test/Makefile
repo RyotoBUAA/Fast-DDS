@@ -9,30 +9,30 @@ all: build
 # 构建所有节点
 build:
 	@echo "构建所有节点..."
-	@./build_all.sh
+	@./tools/build_all.sh
 
 # 清理构建产物
 clean:
 	@echo "清理构建目录和日志..."
 	@rm -rf build build_asan build_ubsan build_full
-	@rm -f *.log *.out
+	@rm -rf output/*.log output/*.out
 	@rm -rf .pids
 	@echo "清理完成"
 
 # 运行完整测试
 test: build
 	@echo "运行模糊测试..."
-	@./run_test.sh
+	@./tools/run_test.sh
 
 # 快速测试（少量消息）
 test-quick: build
 	@echo "运行快速测试（100条消息）..."
-	@./run_test.sh 100 50
+	@./tools/run_test.sh 100 50
 
 # 压力测试（大量消息）
 test-stress: build
 	@echo "运行压力测试（10000条消息）..."
-	@./run_test.sh 10000 10
+	@./tools/run_test.sh 10000 10
 
 # 仅运行 Fuzzer 节点（需要手动启动 Monitor）
 run-fuzzer:
@@ -71,31 +71,31 @@ run-monitor-full:
 # 查看日志
 logs:
 	@echo "=== Fuzzer 日志 ==="
-	@tail -50 fuzzer_node.log 2>/dev/null || echo "无日志文件"
+	@tail -50 output/fuzzer_node.log 2>/dev/null || echo "无日志文件"
 	@echo ""
 	@echo "=== Monitor 1 日志 ==="
-	@tail -50 monitor_node_1.log 2>/dev/null || echo "无日志文件"
+	@tail -50 output/monitor_node_1.log 2>/dev/null || echo "无日志文件"
 	@echo ""
 	@echo "=== Monitor 2 日志 ==="
-	@tail -50 monitor_node_2.log 2>/dev/null || echo "无日志文件"
+	@tail -50 output/monitor_node_2.log 2>/dev/null || echo "无日志文件"
 	@echo ""
 	@echo "=== Monitor 3 日志 ==="
-	@tail -50 monitor_node_3.log 2>/dev/null || echo "无日志文件"
+	@tail -50 output/monitor_node_3.log 2>/dev/null || echo "无日志文件"
 
 # 查看异常检测
 check-anomalies:
 	@echo "检查检测到的异常..."
-	@grep -h "ANOMALY" *.log 2>/dev/null || echo "未检测到异常"
+	@grep -h "ANOMALY" output/*.log 2>/dev/null || echo "未检测到异常"
 
 # 查看错误
 check-errors:
 	@echo "检查错误..."
-	@grep -h "ERROR" *.log 2>/dev/null || echo "无错误"
+	@grep -h "ERROR" output/*.log 2>/dev/null || echo "无错误"
 
 # 统计信息
 stats:
 	@echo "=== 测试统计 ==="
-	@grep -h "Statistics" *.log -A 10 2>/dev/null || echo "无统计信息"
+	@grep -h "Statistics" output/*.log -A 10 2>/dev/null || echo "无统计信息"
 
 # 帮助信息
 help:

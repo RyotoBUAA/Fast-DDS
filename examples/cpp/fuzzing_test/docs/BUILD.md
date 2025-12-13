@@ -103,7 +103,7 @@ fastddsgen -replace TestMessage.idl
 cd /Users/ruanyangdong/Desktop/program/Fast-DDS/examples/cpp/fuzzing_test
 
 # 方法 1：使用我们的构建脚本
-./build_all.sh
+./tools/build_all.sh
 
 # 方法 2：手动 CMake
 mkdir -p build && cd build

@@ -328,7 +328,7 @@ int main(int /*argc*/, char** /*argv*/)
 
     // 设置日志文件
     std::stringstream log_filename;
-    log_filename << "monitor_node_" << MONITOR_ID << ".log";
+    log_filename << "output/monitor_node_" << MONITOR_ID << ".log";
     Logger::instance().set_log_file(log_filename.str());
 
     // 设置信号处理

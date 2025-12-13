@@ -37,8 +37,11 @@ Logger& Logger::instance()
 
 Logger::Logger()
 {
+    // 确保 output 目录存在
+    system("mkdir -p output");
+    
     // 默认日志文件
-    log_file_.open("fuzzing_test.log", std::ios::app);
+    log_file_.open("output/fuzzing_test.log", std::ios::app);
 }
 
 Logger::~Logger()
@@ -55,6 +58,16 @@ void Logger::set_log_file(const std::string& filename)
     {
         log_file_.close();
     }
+    
+    // 确保目录存在（从文件路径中提取目录部分）
+    size_t last_slash = filename.find_last_of("/\\");
+    if (last_slash != std::string::npos)
+    {
+        std::string dir = filename.substr(0, last_slash);
+        std::string mkdir_cmd = "mkdir -p " + dir;
+        system(mkdir_cmd.c_str());
+    }
+    
     log_file_.open(filename, std::ios::app);
 }
 

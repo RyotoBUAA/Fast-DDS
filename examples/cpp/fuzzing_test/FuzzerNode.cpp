@@ -598,7 +598,7 @@ int main(int argc, char** argv)
               << " messages (some may fail, which is normal for fuzzing)" << std::endl;
 
     // 设置日志文件
-    Logger::instance().set_log_file("fuzzer_node.log");
+    Logger::instance().set_log_file("output/fuzzer_node.log");
 
     // 设置信号处理
     SignalHandler::setup();

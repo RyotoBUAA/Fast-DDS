@@ -20,15 +20,18 @@ fuzzing_test/
 │
 ├── fuzzing_test_profile.xml    # DDS QoS 配置文件
 │
-├── build_all.sh                # 一键构建脚本
-├── run_test.sh                 # 测试运行脚本
+├── tools/                      # 构建和测试工具脚本
+│   ├── build_all.sh            # 一键构建脚本
+│   ├── build_advanced.sh       # 高级构建脚本
+│   ├── run_test.sh             # 测试运行脚本
+│   └── run_advanced_test.sh    # 高级测试运行脚本
 │
 └── .gitignore                  # Git 忽略文件配置
 ```
 
 ## 构建产物
 
-运行 `./build_all.sh` 后会生成以下目录：
+运行 `./tools/build_all.sh` 后会生成以下目录：
 
 ```
 fuzzing_test/
@@ -136,7 +139,7 @@ fuzzing_test/
 - 自动复制 XML 配置文件
 - 跨平台支持（Linux/macOS/Windows）
 
-### 6. build_all.sh
+### 6. tools/build_all.sh
 
 自动化构建：
 
@@ -145,7 +148,7 @@ fuzzing_test/
 - 分别编译各个节点
 - 显示构建进度和结果
 
-### 7. run_test.sh
+### 7. tools/run_test.sh
 
 测试自动化：
 

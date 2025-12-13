@@ -537,10 +537,10 @@ if (current_seq != expected_seq)
 cd examples/cpp/fuzzing_test
 
 # 1. 构建所有版本
-./build_all.sh
+./tools/build_all.sh
 
 # 2. 运行测试（1000 条消息）
-./run_test.sh
+./tools/run_test.sh
 
 # 3. 查看结果
 cat monitor_node_*.log | grep ANOMALY
@@ -550,7 +550,7 @@ cat monitor_node_*.log | grep ANOMALY
 
 ```bash
 # 发送 2000 条消息，间隔 100ms
-./run_test.sh 2000 100
+./tools/run_test.sh 2000 100
 ```
 
 ### 查看统计

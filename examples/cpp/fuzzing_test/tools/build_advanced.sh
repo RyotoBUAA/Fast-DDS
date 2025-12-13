@@ -21,8 +21,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${SCRIPT_DIR}/build"
-FASTDDS_ROOT="${SCRIPT_DIR}/../../.."
+FUZZING_TEST_DIR="$SCRIPT_DIR/.."
+BUILD_DIR="${FUZZING_TEST_DIR}/build"
+FASTDDS_ROOT="${FUZZING_TEST_DIR}/../../.."
 
 # 颜色输出
 RED='\033[0;31m'
@@ -118,7 +119,7 @@ build_basic() {
     mkdir -p "${BUILD_DIR}"
     cd "${BUILD_DIR}"
     
-    cmake .. \
+    cmake "${FUZZING_TEST_DIR}" \
         -DCMAKE_BUILD_TYPE=Debug \
         -DENABLE_ASAN=ON \
         -DENABLE_UBSAN=ON
@@ -136,10 +137,10 @@ build_libfuzzer() {
         exit 1
     fi
     
-    mkdir -p "${BUILD_DIR}_libfuzzer"
-    cd "${BUILD_DIR}_libfuzzer"
+    mkdir -p "${FUZZING_TEST_DIR}/build_libfuzzer"
+    cd "${FUZZING_TEST_DIR}/build_libfuzzer"
     
-    CC=clang CXX=clang++ cmake .. \
+    CC=clang CXX=clang++ cmake "${FUZZING_TEST_DIR}" \
         -DCMAKE_BUILD_TYPE=Debug \
         -DENABLE_LIBFUZZER=ON \
         -DENABLE_ASAN=ON \
@@ -164,10 +165,10 @@ build_afl() {
         exit 1
     fi
     
-    mkdir -p "${BUILD_DIR}_afl"
-    cd "${BUILD_DIR}_afl"
+    mkdir -p "${FUZZING_TEST_DIR}/build_afl"
+    cd "${FUZZING_TEST_DIR}/build_afl"
     
-    CC=afl-clang-fast CXX=afl-clang-fast++ cmake .. \
+    CC=afl-clang-fast CXX=afl-clang-fast++ cmake "${FUZZING_TEST_DIR}" \
         -DCMAKE_BUILD_TYPE=Debug \
         -DENABLE_AFL=ON \
         -DENABLE_ASAN=ON \
@@ -201,11 +202,11 @@ clean_build() {
     print_info "清理构建目录..."
     
     rm -rf "${BUILD_DIR}"
-    rm -rf "${BUILD_DIR}_libfuzzer"
-    rm -rf "${BUILD_DIR}_afl"
-    rm -rf "${SCRIPT_DIR}/crashes"
-    rm -rf "${SCRIPT_DIR}/hangs"
-    rm -rf "${SCRIPT_DIR}/corpus"
+    rm -rf "${FUZZING_TEST_DIR}/build_libfuzzer"
+    rm -rf "${FUZZING_TEST_DIR}/build_afl"
+    rm -rf "${FUZZING_TEST_DIR}/crashes"
+    rm -rf "${FUZZING_TEST_DIR}/hangs"
+    rm -rf "${FUZZING_TEST_DIR}/corpus"
     
     print_success "清理完成"
 }
@@ -290,16 +291,16 @@ if [ -d "${BUILD_DIR}" ]; then
     ls -la "${BUILD_DIR}"/*.node "${BUILD_DIR}"/*_fuzzer* 2>/dev/null || true
 fi
 
-if [ -d "${BUILD_DIR}_libfuzzer" ]; then
+if [ -d "${FUZZING_TEST_DIR}/build_libfuzzer" ]; then
     echo ""
-    echo "libFuzzer 构建目录: ${BUILD_DIR}_libfuzzer/"
-    ls -la "${BUILD_DIR}_libfuzzer"/*harness* 2>/dev/null || true
+    echo "libFuzzer 构建目录: ${FUZZING_TEST_DIR}/build_libfuzzer/"
+    ls -la "${FUZZING_TEST_DIR}/build_libfuzzer"/*harness* 2>/dev/null || true
 fi
 
-if [ -d "${BUILD_DIR}_afl" ]; then
+if [ -d "${FUZZING_TEST_DIR}/build_afl" ]; then
     echo ""
-    echo "AFL++ 构建目录: ${BUILD_DIR}_afl/"
-    ls -la "${BUILD_DIR}_afl"/*harness* 2>/dev/null || true
+    echo "AFL++ 构建目录: ${FUZZING_TEST_DIR}/build_afl/"
+    ls -la "${FUZZING_TEST_DIR}/build_afl"/*harness* 2>/dev/null || true
 fi
 
 echo ""
@@ -319,4 +320,5 @@ echo ""
 echo "4. AFL++ 模糊测试:"
 echo "   afl-fuzz -i seeds/ -o output/ -x dictionaries/rtps.dict -- ./build_afl/afl_harness @@"
 echo ""
+
 

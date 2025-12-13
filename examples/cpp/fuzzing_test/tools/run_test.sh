@@ -17,10 +17,10 @@
 #   ./run_test.sh 2000 50 attack    # 攻击模式
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR"
+FUZZING_TEST_DIR="$SCRIPT_DIR/.."
 
-# 项目根目录（相对于 examples/cpp/fuzzing_test）
-PROJECT_ROOT="$SCRIPT_DIR/../../../"
+# 项目根目录（相对于 examples/cpp/fuzzing_test/tools）
+PROJECT_ROOT="$FUZZING_TEST_DIR/../../.."
 BUILD_DIR="$PROJECT_ROOT/build"
 EXAMPLE_BUILD_DIR="$BUILD_DIR/examples/cpp/fuzzing_test"
 
@@ -88,9 +88,13 @@ check_advanced_binaries() {
 
 check_basic_binaries
 
+# 切换到 fuzzing_test 目录
+cd "$FUZZING_TEST_DIR"
+
 # 清理旧的日志文件
 echo -e "${YELLOW}清理旧日志文件...${NC}"
-rm -f *.log
+mkdir -p output
+rm -f output/*.log output/*.out
 
 # 创建 PID 文件目录
 mkdir -p .pids
@@ -123,7 +127,7 @@ cleanup() {
     echo ""
     
     # 显示日志摘要
-    for log in monitor_node_*.log; do
+    for log in output/monitor_node_*.log; do
         if [ -f "$log" ]; then
             echo -e "${BLUE}--- $log ---${NC}"
             grep -E "(ANOMALY|ERROR|Statistics)" "$log" | tail -20 || echo "无异常检测"
@@ -132,7 +136,7 @@ cleanup() {
     done
     
     echo -e "${GREEN}日志文件：${NC}"
-    ls -lh *.log 2>/dev/null || echo "无日志文件"
+    ls -lh output/*.log 2>/dev/null || echo "无日志文件"
     
     exit 0
 }
@@ -144,21 +148,21 @@ echo -e "${YELLOW}启动监控节点...${NC}"
 
 # 启动 Monitor Node 1 (ASAN)
 echo -e "${BLUE}启动 Monitor Node 1 (ASAN)...${NC}"
-"$EXAMPLE_BUILD_DIR/monitor_node_asan" > monitor1.out 2>&1 &
+"$EXAMPLE_BUILD_DIR/monitor_node_asan" > output/monitor1.out 2>&1 &
 MONITOR1_PID=$!
 echo $MONITOR1_PID > .pids/monitor1.pid
 echo "  PID: $MONITOR1_PID"
 
 # 启动 Monitor Node 2 (UBSAN)
 echo -e "${BLUE}启动 Monitor Node 2 (UBSAN)...${NC}"
-"$EXAMPLE_BUILD_DIR/monitor_node_ubsan" > monitor2.out 2>&1 &
+"$EXAMPLE_BUILD_DIR/monitor_node_ubsan" > output/monitor2.out 2>&1 &
 MONITOR2_PID=$!
 echo $MONITOR2_PID > .pids/monitor2.pid
 echo "  PID: $MONITOR2_PID"
 
 # 启动 Monitor Node 3 (ASAN+UBSAN)
 echo -e "${BLUE}启动 Monitor Node 3 (ASAN+UBSAN)...${NC}"
-"$EXAMPLE_BUILD_DIR/monitor_node_full" > monitor3.out 2>&1 &
+"$EXAMPLE_BUILD_DIR/monitor_node_full" > output/monitor3.out 2>&1 &
 MONITOR3_PID=$!
 echo $MONITOR3_PID > .pids/monitor3.pid
 echo "  PID: $MONITOR3_PID"
@@ -253,4 +257,5 @@ sleep 5
 
 # 清理
 cleanup
+
 

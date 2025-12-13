@@ -79,7 +79,7 @@ make
 
 ```bash
 # 使用提供的脚本一键编译所有版本
-./build_all.sh
+./tools/build_all.sh
 ```
 
 ## 运行
@@ -107,10 +107,10 @@ make
 
 ```bash
 # 启动所有节点（在后台运行监控节点）
-./run_test.sh
+./tools/run_test.sh
 
 # 指定参数运行
-./run_test.sh 2000 50  # 发送2000条消息，间隔50ms
+./tools/run_test.sh 2000 50  # 发送2000条消息，间隔50ms
 ```
 
 ## 输出和日志

@@ -24,8 +24,10 @@
 |------|------|
 | `CMakeLists.txt` | CMake 构建配置（支持 ASAN/UBSAN） |
 | `Makefile` | 便捷命令接口 |
-| `build_all.sh` | 一键构建脚本 |
-| `run_test.sh` | 自动化测试脚本 |
+| `tools/build_all.sh` | 一键构建脚本 |
+| `tools/build_advanced.sh` | 高级构建脚本 |
+| `tools/run_test.sh` | 自动化测试脚本 |
+| `tools/run_advanced_test.sh` | 高级测试运行脚本 |
 
 ### 3. 配置和文档
 

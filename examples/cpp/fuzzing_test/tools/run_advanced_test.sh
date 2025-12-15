@@ -22,7 +22,16 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FUZZING_TEST_DIR="$SCRIPT_DIR/.."
-BUILD_DIR="${FUZZING_TEST_DIR}/build"
+FASTDDS_ROOT="${FUZZING_TEST_DIR}/../../.."
+
+# 支持两种构建目录结构：
+# 1. out-of-source 构建: Fast-DDS/build/examples/cpp/fuzzing_test/
+# 2. in-source 构建: Fast-DDS/examples/cpp/fuzzing_test/build/
+if [ -d "${FASTDDS_ROOT}/build/examples/cpp/fuzzing_test" ]; then
+    BUILD_DIR="${FASTDDS_ROOT}/build/examples/cpp/fuzzing_test"
+else
+    BUILD_DIR="${FUZZING_TEST_DIR}/build"
+fi
 
 # 默认参数
 MODE="hybrid"

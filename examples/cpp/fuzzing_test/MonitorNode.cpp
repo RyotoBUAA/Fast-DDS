@@ -14,8 +14,11 @@
 
 /**
  * @file MonitorNode.cpp
- * 监控节点实现 - 接收消息并检测异常
- * 配合 ASAN/UBSAN 检测内存和未定义行为错误
+ * 监控节点实现 - 接收消息，让 ASAN/UBSAN 检测 DDS 底层错误
+ * 
+ * 注意：此节点不做任何应用层检测，只是简单接收消息。
+ * 真正的错误检测由 ASAN/UBSAN 在 DDS 底层（序列化/反序列化、
+ * 内存管理、协议处理）自动完成。
  */
 
 #include <iostream>
@@ -43,39 +46,44 @@ using namespace eprosima::fastdds::dds;
 
 /**
  * @brief 监控节点的数据读取监听器
+ * 
+ * 只做最基本的消息接收，不做任何应用层检测。
+ * 让 ASAN/UBSAN 检测 DDS 底层的内存和未定义行为错误。
  */
 class MonitorListener : public DataReaderListener
 {
 public:
     MonitorListener(int monitor_id)
         : monitor_id_(monitor_id)
-        , detector_(monitor_id)
-        , expected_seq_(0)
+        , messages_received_(0)
+        , total_bytes_(0)
+        , start_time_(std::chrono::steady_clock::now())
     {
         std::stringstream ss;
         ss << "Monitor-" << monitor_id_;
         node_name_ = ss.str();
         
         Logger::instance().log(LogLevel::INFO, node_name_,
-                              "Listener initialized");
+                              "Listener initialized (passive mode - no app-level checks)");
     }
 
     ~MonitorListener() override
     {
-        detector_.print_statistics();
+        print_statistics();
     }
 
     void on_data_available(DataReader* reader) override
     {
-        SimpleTestMessage simple_msg;
+        SimpleTestMessage msg;
         SampleInfo info;
 
-        // 尝试读取简单消息
-        if (reader->take_next_sample(&simple_msg, &info) == RETCODE_OK)
+        // 循环读取所有可用消息 - DDS 底层会在这里进行反序列化
+        // 如果底层有内存问题，ASAN/UBSAN 会在此处检测到
+        while (reader->take_next_sample(&msg, &info) == RETCODE_OK)
         {
             if (info.valid_data)
             {
-                process_simple_message(simple_msg);
+                process_message(msg);
             }
         }
     }
@@ -97,74 +105,67 @@ public:
     }
 
 private:
-    void process_simple_message(const SimpleTestMessage& msg)
+    /**
+     * @brief 处理接收到的消息 - 只做统计，不做任何检测
+     * 
+     * 消息在到达这里之前，已经经过了 DDS 底层的完整处理：
+     * - RTPS 协议解析
+     * - CDR 反序列化  
+     * - 内存分配和复制
+     * 
+     * 如果这些底层操作有问题，ASAN/UBSAN 会自动报告。
+     */
+    void process_message(const SimpleTestMessage& msg)
     {
-        // 记录接收到的消息
-        detector_.record_message_received(sizeof(msg));
-
-        // 检测序列号异常
-        detector_.check_sequence_anomaly(msg.seq_num(), expected_seq_);
-        expected_seq_ = msg.seq_num() + 1;
-
-        // 检测消息内容
-        std::string message_str = msg.message();
+        messages_received_++;
         
-        // 检测可能的内存问题（超过 5KB 视为大消息）
-        if (message_str.size() > 5000)
+        // 获取消息内容 - 这会触发 DDS 内部的字符串处理
+        // 不做任何检查，只是正常使用数据
+        const std::string& message_str = msg.message();
+        total_bytes_ += message_str.size();
+        
+        // 每 100 条消息打印一次进度
+        if (messages_received_ % 100 == 0)
         {
             std::stringstream ss;
-            ss << "Message size " << message_str.size() << " bytes exceeds expected bounds";
-            Logger::instance().log_anomaly("LARGE_MESSAGE", ss.str());
-            detector_.record_error();
-        }
-
-        // 检测特殊字符或格式错误
-        for (char c : message_str)
-        {
-            if (c < 0 || c > 127)
-            {
-                Logger::instance().log_anomaly("INVALID_CHAR",
-                    "Non-ASCII character detected in message");
-                detector_.record_error();
-                break;
-            }
-        }
-
-        // 检测数据类型字段
-        uint8_t data_type = msg.data_type();
-        if (data_type > 100)  // 假设有效范围是 0-100
-        {
-            std::stringstream ss;
-            ss << "Invalid data_type value: " << static_cast<int>(data_type);
-            Logger::instance().log_anomaly("INVALID_DATA_TYPE", ss.str());
-            detector_.record_error();
-        }
-
-        // 定期打印统计信息
-        if (msg.seq_num() % 100 == 0)
-        {
-            std::stringstream ss;
-            ss << "Received message #" << msg.seq_num()
-               << " (type=" << static_cast<int>(data_type) << ")";
+            ss << "Progress: " << messages_received_ << " messages received, "
+               << total_bytes_ << " bytes total";
             Logger::instance().log(LogLevel::INFO, node_name_, ss.str());
         }
+    }
 
-        // 模拟一些可能触发 ASAN/UBSAN 的操作（用于测试）
-        #ifdef __DEBUG
-        // 边界检查（如果 fuzzer 发送畸形数据，这里可能触发 sanitizer）
-        if (message_str.length() > 0)
+    void print_statistics()
+    {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            now - start_time_).count();
+        
+        std::stringstream ss;
+        ss << "\n========== Statistics for " << node_name_ << " ==========";
+        ss << "\n  Runtime: " << elapsed << " seconds";
+        ss << "\n  Messages received: " << messages_received_;
+        ss << "\n  Total bytes: " << total_bytes_;
+        
+        if (elapsed > 0)
         {
-            // 安全的访问
-            volatile char first_char = message_str[0];
-            (void)first_char;  // 避免未使用警告
+            ss << "\n  Messages/sec: " 
+               << static_cast<double>(messages_received_) / elapsed;
+            ss << "\n  Throughput: "
+               << static_cast<double>(total_bytes_) / elapsed / 1024 / 1024
+               << " MB/s";
         }
-        #endif
+        
+        ss << "\n  ASAN/UBSAN errors: Check stderr for any sanitizer reports";
+        ss << "\n==================================================";
+        
+        Logger::instance().log(LogLevel::INFO, node_name_, ss.str());
     }
 
     int monitor_id_;
     std::string node_name_;
-    AnomalyDetector detector_;
-    uint32_t expected_seq_;
+    uint64_t messages_received_;
+    uint64_t total_bytes_;
+    std::chrono::steady_clock::time_point start_time_;
 };
 
 /**

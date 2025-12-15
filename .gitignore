@@ -383,6 +383,7 @@ __pycache__/
 .Python
 env/
 build/
+build_fuzz/
 develop-eggs/
 dist/
 downloads/

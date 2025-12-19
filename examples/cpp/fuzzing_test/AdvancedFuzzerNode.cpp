@@ -14,13 +14,13 @@
 
 /**
  * @file AdvancedFuzzerNode.cpp
- * @brief 高级模糊测试节点 - 集成协议感知模糊测试
+ * @brief RTPS 协议层模糊测试节点 - 基于响应反馈的网络模糊测试
  * 
- * 这个文件实现了一个高级的模糊测试节点，使用：
- * 1. RTPS 协议感知的结构化模糊测试
- * 2. 基于覆盖率的变异策略（模拟）
- * 3. 种子队列和语料库管理
- * 4. 多种 DDS 攻击模式
+ * 实现了业界成熟的网络协议模糊测试技术：
+ * 1. AFL-Net 风格：基于响应码和响应时间的覆盖率
+ * 2. StateAFL 风格：基于协议状态机转换的覆盖率
+ * 3. Boofuzz 风格：基于响应内容差异的去重
+ * 4. 能量调度：优先变异有价值的种子
  */
 
 #include <iostream>
@@ -42,19 +42,12 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-
-#include <fastdds/dds/domain/DomainParticipantFactory.hpp>
-#include <fastdds/dds/domain/DomainParticipant.hpp>
-#include <fastdds/dds/publisher/Publisher.hpp>
-#include <fastdds/dds/publisher/DataWriter.hpp>
-#include <fastdds/dds/publisher/DataWriterListener.hpp>
-#include <fastdds/dds/topic/TypeSupport.hpp>
+#include <fcntl.h>
+#include <poll.h>
+#include <errno.h>
 
 #include "Common.hpp"
-#include "TestMessagePubSubTypes.hpp"
 #include "RTPSProtocolFuzzer.hpp"
-
-using namespace eprosima::fastdds::dds;
 
 // ============================================================================
 // 配置常量
@@ -62,64 +55,153 @@ using namespace eprosima::fastdds::dds;
 
 constexpr size_t MAX_CORPUS_SIZE = 1000;
 constexpr size_t MAX_SEED_SIZE = 65536;
-constexpr int RTPS_DEFAULT_PORT = 7400;
-constexpr int RTPS_MULTICAST_PORT = 7401;
+
+// RTPS 端口计算参数 (根据 RTPS 2.3 规范)
+// 公式: port = PB + DG * domainId + offset + PG * participantId
+constexpr int RTPS_PORT_BASE = 7400;           // PB
+constexpr int RTPS_DOMAIN_GAIN = 250;          // DG
+constexpr int RTPS_PARTICIPANT_GAIN = 2;       // PG
+constexpr int RTPS_D0_SPDP_MULTICAST = 0;      // d0: SPDP multicast
+constexpr int RTPS_D1_METATRAFFIC_UNICAST = 10; // d1: metatraffic unicast
+constexpr int RTPS_D2_USER_MULTICAST = 1;      // d2: user data multicast
+constexpr int RTPS_D3_USER_UNICAST = 11;       // d3: user data unicast
+
+// 默认值 (domain 0)
+constexpr int RTPS_SPDP_MULTICAST_PORT = 7400;     // 发现多播端口
+constexpr int RTPS_USER_MULTICAST_PORT = 7401;     // 用户数据多播端口
+constexpr const char* RTPS_MULTICAST_ADDR = "239.255.0.1";
+constexpr int RESPONSE_TIMEOUT_MS = 100;
+
+/**
+ * @brief 计算 RTPS 端口
+ */
+inline int calculate_rtps_port(int domain_id, int participant_id, bool is_metatraffic, bool is_multicast)
+{
+    if (is_multicast) {
+        if (is_metatraffic) {
+            // SPDP 多播端口
+            return RTPS_PORT_BASE + RTPS_DOMAIN_GAIN * domain_id + RTPS_D0_SPDP_MULTICAST;
+        } else {
+            // 用户数据多播端口
+            return RTPS_PORT_BASE + RTPS_DOMAIN_GAIN * domain_id + RTPS_D2_USER_MULTICAST;
+        }
+    } else {
+        if (is_metatraffic) {
+            // Metatraffic 单播端口
+            return RTPS_PORT_BASE + RTPS_DOMAIN_GAIN * domain_id + 
+                   RTPS_D1_METATRAFFIC_UNICAST + RTPS_PARTICIPANT_GAIN * participant_id;
+        } else {
+            // 用户数据单播端口
+            return RTPS_PORT_BASE + RTPS_DOMAIN_GAIN * domain_id + 
+                   RTPS_D3_USER_UNICAST + RTPS_PARTICIPANT_GAIN * participant_id;
+        }
+    }
+}
 
 // ============================================================================
-// 种子管理
+// RTPS 协议状态机 (StateAFL 风格)
 // ============================================================================
 
 /**
- * @brief 种子条目
+ * @brief RTPS 协议状态枚举
+ * 
+ * 参考 StateAFL：通过追踪协议状态转换来引导模糊测试
+ * 不同的状态转换意味着触发了不同的代码路径
  */
-struct SeedEntry {
-    std::vector<uint8_t> data;
-    double energy;           // 能量值（用于调度）
-    size_t hit_count;        // 命中次数
-    size_t exec_time_us;     // 平均执行时间
-    bool is_favored;         // 是否是受青睐的种子
-    
-    SeedEntry() : energy(1.0), hit_count(0), exec_time_us(0), is_favored(false) {}
-    explicit SeedEntry(std::vector<uint8_t> d) 
-        : data(std::move(d)), energy(1.0), hit_count(0), exec_time_us(0), is_favored(false) {}
+enum class RTPSState : uint8_t {
+    INITIAL = 0,            // 初始状态
+    SENT_DISCOVERY,         // 发送了发现消息
+    SENT_DATA,              // 发送了数据消息
+    SENT_HEARTBEAT,         // 发送了心跳
+    SENT_ACKNACK,           // 发送了确认
+    SENT_GAP,               // 发送了间隙
+    GOT_RESPONSE,           // 收到响应
+    GOT_RTPS_RESPONSE,      // 收到有效 RTPS 响应
+    GOT_ERROR_RESPONSE,     // 收到错误响应
+    TIMEOUT,                // 超时
+    TARGET_CRASHED,         // 目标崩溃
+    NUM_STATES
 };
 
 /**
- * @brief 种子队列管理器
+ * @brief 响应类型枚举
+ */
+enum class ResponseType : uint8_t {
+    NONE = 0,
+    TIMEOUT,
+    VALID_RTPS,             // 有效的 RTPS 响应
+    INVALID_RTPS,           // 无效的 RTPS（可能是错误处理响应）
+    ICMP_UNREACHABLE,       // ICMP 不可达
+    CONNECTION_REFUSED,
+    SEND_ERROR,
+    NUM_TYPES
+};
+
+// ============================================================================
+// 种子管理 (AFL 风格能量调度)
+// ============================================================================
+
+struct SeedEntry {
+    std::vector<uint8_t> data;
+    double energy;              // 能量值：决定被选中的概率
+    size_t exec_count;          // 执行次数
+    size_t new_cov_count;       // 发现新覆盖的次数
+    uint64_t avg_exec_time_us;  // 平均执行时间
+    bool is_favored;            // 是否是最小化种子
+    RTPSState last_state;       // 上次执行后的状态
+    
+    // 记录这个种子触发过的状态转换
+    std::set<uint16_t> triggered_edges;
+    
+    SeedEntry() 
+        : energy(1.0), exec_count(0), new_cov_count(0), avg_exec_time_us(0)
+        , is_favored(false), last_state(RTPSState::INITIAL) {}
+    
+    explicit SeedEntry(std::vector<uint8_t> d) 
+        : data(std::move(d)), energy(1.0), exec_count(0), new_cov_count(0)
+        , avg_exec_time_us(0), is_favored(false), last_state(RTPSState::INITIAL) {}
+};
+
+/**
+ * @brief 种子队列管理器 (AFL 风格)
  */
 class SeedQueue {
 public:
-    SeedQueue() = default;
-    
-    void add_seed(std::vector<uint8_t> seed)
+    SeedEntry* add_seed(std::vector<uint8_t> seed, bool is_interesting = true)
     {
         if (seed.empty() || seed.size() > MAX_SEED_SIZE) {
-            return;
+            return nullptr;
         }
         
-        // 计算种子哈希，避免重复
         size_t hash = compute_hash(seed);
         if (seen_hashes_.count(hash) > 0) {
-            return;
+            return nullptr;  // 已存在
         }
         
         seen_hashes_.insert(hash);
         seeds_.emplace_back(std::move(seed));
         
-        // 如果超出最大大小，移除最老的种子
-        while (seeds_.size() > MAX_CORPUS_SIZE) {
-            seen_hashes_.erase(compute_hash(seeds_.front().data));
-            seeds_.pop_front();
-        }
-    }
-    
-    SeedEntry* select_seed()
-    {
-        if (seeds_.empty()) {
-            return nullptr;
+        SeedEntry* new_seed = &seeds_.back();
+        if (is_interesting) {
+            new_seed->energy = 2.0;  // 有趣的种子初始能量更高
         }
         
-        // 基于能量的选择
+        // 超出最大大小时移除最老的低能量种子
+        while (seeds_.size() > MAX_CORPUS_SIZE) {
+            remove_worst_seed();
+        }
+        
+        return new_seed;
+    }
+    
+    /**
+     * @brief 基于能量的种子选择 (AFL 风格)
+     */
+    SeedEntry* select_seed()
+    {
+        if (seeds_.empty()) return nullptr;
+        
+        // 计算总能量
         double total_energy = 0;
         for (const auto& seed : seeds_) {
             total_energy += seed.energy;
@@ -129,6 +211,7 @@ public:
             return &seeds_[rand() % seeds_.size()];
         }
         
+        // 轮盘赌选择
         double r = static_cast<double>(rand()) / RAND_MAX * total_energy;
         double cumulative = 0;
         
@@ -142,162 +225,353 @@ public:
         return &seeds_.back();
     }
     
-    void update_energy(SeedEntry* seed, bool found_new_coverage)
+    /**
+     * @brief 更新种子能量
+     * 
+     * 能量调度策略：
+     * - 发现新覆盖：能量 x2
+     * - 未发现新覆盖：能量 x0.9
+     * - 触发新状态转换：额外 +0.5
+     */
+    void update_seed(SeedEntry* seed, bool found_new_coverage, bool found_new_state_edge)
     {
-        if (seed == nullptr) return;
+        if (!seed) return;
         
-        seed->hit_count++;
+        seed->exec_count++;
         
         if (found_new_coverage) {
-            // 发现新覆盖，增加能量
+            seed->new_cov_count++;
             seed->energy = std::min(seed->energy * 2.0, 100.0);
             seed->is_favored = true;
         } else {
-            // 没有新覆盖，减少能量
             seed->energy = std::max(seed->energy * 0.9, 0.1);
+        }
+        
+        if (found_new_state_edge) {
+            seed->energy = std::min(seed->energy + 0.5, 100.0);
         }
     }
     
     size_t size() const { return seeds_.size(); }
     
-    void load_from_directory(const std::string& dir)
-    {
-        // 简单实现：加载目录下的所有文件作为种子
-        // 实际使用时需要使用 dirent.h 或 filesystem
-        std::cout << "Loading seeds from: " << dir << std::endl;
-    }
-    
     void save_to_directory(const std::string& dir)
     {
-        // 创建目录（如果不存在）
         std::string mkdir_cmd = "mkdir -p " + dir;
         system(mkdir_cmd.c_str());
         
-        // 保存语料库到目录
-        std::cout << "Saving corpus to: " << dir << std::endl;
-        
         size_t idx = 0;
+        size_t favored_count = 0;
+        
         for (const auto& seed : seeds_) {
-            std::string filename = dir + "/seed_" + std::to_string(idx++) + ".bin";
+            std::string prefix = seed.is_favored ? "fav_" : "";
+            std::string filename = dir + "/" + prefix + "seed_" + std::to_string(idx++) + ".bin";
             std::ofstream file(filename, std::ios::binary);
             if (file) {
                 file.write(reinterpret_cast<const char*>(seed.data.data()), seed.data.size());
             }
+            if (seed.is_favored) favored_count++;
         }
+        
+        std::cout << "Saved " << seeds_.size() << " seeds (" << favored_count << " favored) to: " << dir << std::endl;
+    }
+    
+    void print_stats() const
+    {
+        size_t favored = 0;
+        double total_energy = 0;
+        size_t total_new_cov = 0;
+        
+        for (const auto& seed : seeds_) {
+            if (seed.is_favored) favored++;
+            total_energy += seed.energy;
+            total_new_cov += seed.new_cov_count;
+        }
+        
+        std::cout << "  Seeds: " << seeds_.size() << " (favored: " << favored << ")" << std::endl;
+        std::cout << "  Total energy: " << std::fixed << std::setprecision(1) << total_energy << std::endl;
+        std::cout << "  Total new coverage discoveries: " << total_new_cov << std::endl;
     }
 
 private:
     std::deque<SeedEntry> seeds_;
     std::set<size_t> seen_hashes_;
     
+    void remove_worst_seed()
+    {
+        if (seeds_.empty()) return;
+        
+        // 找到能量最低且不是 favored 的种子
+        auto worst = seeds_.begin();
+        for (auto it = seeds_.begin(); it != seeds_.end(); ++it) {
+            if (!it->is_favored && it->energy < worst->energy) {
+                worst = it;
+            }
+        }
+        
+        seen_hashes_.erase(compute_hash(worst->data));
+        seeds_.erase(worst);
+    }
+    
     static size_t compute_hash(const std::vector<uint8_t>& data)
     {
-        size_t hash = 0;
-        for (size_t i = 0; i < data.size(); ++i) {
-            hash ^= static_cast<size_t>(data[i]) << (i % 56);
-            hash = (hash << 7) | (hash >> 57);
+        size_t hash = 0x811c9dc5;  // FNV offset basis
+        for (uint8_t b : data) {
+            hash ^= b;
+            hash *= 0x01000193;  // FNV prime
         }
         return hash;
     }
 };
 
 // ============================================================================
-// 网络响应特征 (参考 AFL-Net / Boofuzz 设计)
+// 网络响应特征 (AFL-Net / Boofuzz 风格)
 // ============================================================================
 
 /**
- * @brief DDS 协议状态枚举（用于状态机覆盖率追踪）
- * 参考 StateAFL 的状态引导模糊测试思想
- */
-enum class DDSProtocolState {
-    INITIAL = 0,           // 初始状态
-    DISCOVERING,           // 发现中
-    MATCHED,              // 已匹配
-    COMMUNICATING,        // 通信中
-    WAITING_ACK,          // 等待确认
-    ACK_RECEIVED,         // 收到确认
-    NACK_RECEIVED,        // 收到否认
-    HEARTBEAT_SENT,       // 心跳已发送
-    DISCONNECTED,         // 断开连接
-    ERROR_STATE,          // 错误状态
-    TIMEOUT,              // 超时
-    NUM_STATES            // 状态数量
-};
-
-/**
- * @brief 网络响应特征结构
+ * @brief 网络响应特征
  * 
- * 这是网络协议模糊测试的核心：不是追踪代码覆盖率，
- * 而是追踪目标系统的"响应行为覆盖率"。
- * 
- * 参考工具：
- * - Boofuzz: 基于响应差异的模糊测试
- * - AFL-Net: 基于响应码和状态的网络模糊测试
- * - StateAFL: 基于协议状态机的模糊测试
+ * 这是网络模糊测试的核心：不追踪代码覆盖率，而是追踪响应行为
  */
 struct NetworkResponseProfile {
-    // === 第一层：DDS API 响应 ===
-    ReturnCode_t write_result = RETCODE_OK;   // write() 返回码
-    int matched_count = 0;                     // 当前匹配的订阅者数量
-    int matched_count_change = 0;              // 匹配数量变化
-    bool publication_matched_changed = false;  // 匹配状态是否变化
+    // === 基本响应信息 ===
+    ResponseType response_type = ResponseType::NONE;
+    bool send_success = false;
+    int error_code = 0;
     
-    // === 第二层：时间特征（重要！AFL-Net的关键指标）===
-    uint64_t response_time_us = 0;            // 响应时间（微秒）
-    int timing_bucket = 0;                    // 时间分桶（0-5）
-    bool timeout_occurred = false;            // 是否超时
+    // === 时间特征 (AFL-Net 关键指标) ===
+    uint64_t response_time_us = 0;
+    int timing_bucket = 0;  // 0-5 分桶
     
-    // === 第三层：连接/系统状态 ===
-    bool connection_alive = true;             // 连接是否存活
-    bool connection_dropped = false;          // 连接是否断开（崩溃指标）
-    bool target_responsive = true;            // 目标是否响应
+    // === 响应内容特征 (Boofuzz 风格) ===
+    size_t response_size = 0;
+    size_t response_hash = 0;           // 完整响应哈希
+    size_t response_prefix_hash = 0;    // 前 64 字节哈希（快速比较）
     
-    // === 第四层：协议状态（StateAFL 思想）===
-    DDSProtocolState current_state = DDSProtocolState::INITIAL;
-    DDSProtocolState previous_state = DDSProtocolState::INITIAL;
-    bool state_changed = false;               // 状态是否变化
+    // === RTPS 协议特征 ===
+    bool is_valid_rtps = false;
+    uint8_t rtps_version_major = 0;
+    uint8_t rtps_version_minor = 0;
+    std::vector<uint8_t> submessage_ids;  // 响应中的 submessage 类型列表
     
-    // === 第五层：错误分类 ===
-    int error_code = 0;                       // 错误码
-    bool is_crash = false;                    // 是否崩溃
-    bool is_hang = false;                     // 是否挂起
+    // === 状态机特征 (StateAFL 风格) ===
+    RTPSState inferred_state = RTPSState::INITIAL;
     
-    // 计算响应时间分桶（用于区分快/慢响应，检测性能问题）
     static int compute_timing_bucket(uint64_t time_us) {
-        if (time_us < 1000) return 0;          // <1ms: 极快
-        if (time_us < 10000) return 1;         // 1-10ms: 快
-        if (time_us < 100000) return 2;        // 10-100ms: 正常
-        if (time_us < 1000000) return 3;       // 100ms-1s: 慢
-        if (time_us < 5000000) return 4;       // 1-5s: 很慢
-        return 5;                              // >5s: 超时/挂起
+        if (time_us < 1000) return 0;       // <1ms
+        if (time_us < 10000) return 1;      // 1-10ms
+        if (time_us < 100000) return 2;     // 10-100ms
+        if (time_us < 1000000) return 3;    // 100ms-1s
+        if (time_us < 5000000) return 4;    // 1-5s
+        return 5;                            // >5s (超时/挂起)
     }
 };
 
+// ============================================================================
+// 覆盖率追踪器 (AFL-Net + StateAFL 风格)
+// ============================================================================
+
 /**
- * @brief 网络响应覆盖率追踪器
+ * @brief 多维度覆盖率追踪器
  * 
- * 实现了业界成熟的网络模糊测试算法：
- * 1. 响应哈希去重（Boofuzz 风格）
- * 2. 状态转换追踪（StateAFL 风格）
- * 3. 响应时间分桶（AFL-Net 风格）
- * 4. 多维度覆盖率位图（AFL 风格）
+ * 追踪多个维度的"覆盖率"：
+ * 1. 响应类型覆盖
+ * 2. 响应时间分桶覆盖
+ * 3. 响应内容差异覆盖 (Boofuzz)
+ * 4. 状态转换边覆盖 (StateAFL)
+ * 5. Submessage 序列覆盖
  */
-class CoverageTracker {
+class ResponseCoverageTracker {
 public:
     static constexpr size_t BITMAP_SIZE = 65536;
-    static constexpr size_t STATE_COUNT = static_cast<size_t>(DDSProtocolState::NUM_STATES);
+    static constexpr size_t STATE_COUNT = static_cast<size_t>(RTPSState::NUM_STATES);
     
-    CoverageTracker() 
+    ResponseCoverageTracker()
         : bitmap_(BITMAP_SIZE, 0)
         , virgin_bitmap_(BITMAP_SIZE, 0)
-        , last_state_(DDSProtocolState::INITIAL)
-        , last_matched_count_(0)
+        , current_state_(RTPSState::INITIAL)
     {
     }
     
     /**
-     * @brief 记录一个覆盖点（底层方法）
+     * @brief 记录响应特征到覆盖率位图
      */
+    void record_response(const NetworkResponseProfile& profile, 
+                        const std::vector<uint8_t>& input)
+    {
+        new_coverage_found_ = false;
+        new_state_edge_found_ = false;
+        
+        // =============================================
+        // 1. 响应类型覆盖 (基础)
+        // =============================================
+        record_hit(static_cast<size_t>(profile.response_type));
+        
+        // =============================================
+        // 2. 响应时间分桶覆盖 (AFL-Net 风格)
+        // =============================================
+        record_hit(0x100 | profile.timing_bucket);
+        
+        // 时间异常检测
+        if (profile.timing_bucket >= 4) {
+            record_hit(0x180 | profile.timing_bucket);  // 慢响应单独追踪
+        }
+        
+        // =============================================
+        // 3. 响应大小分桶覆盖
+        // =============================================
+        int size_bucket = 0;
+        if (profile.response_size > 0) size_bucket = 1;
+        if (profile.response_size > 64) size_bucket = 2;
+        if (profile.response_size > 256) size_bucket = 3;
+        if (profile.response_size > 1024) size_bucket = 4;
+        if (profile.response_size > 4096) size_bucket = 5;
+        record_hit(0x200 | size_bucket);
+        
+        // =============================================
+        // 4. 响应内容差异覆盖 (Boofuzz 风格)
+        // =============================================
+        if (profile.response_hash != 0) {
+            // 完整响应去重
+            if (seen_response_hashes_.insert(profile.response_hash).second) {
+                unique_responses_++;
+                new_coverage_found_ = true;
+            }
+            
+            // 响应前缀哈希（快速分类）
+            record_hit(0x1000 | (profile.response_prefix_hash % 0x1000));
+            
+            // 响应哈希分桶
+            record_hit(0x2000 | (profile.response_hash % 0x1000));
+        }
+        
+        // =============================================
+        // 5. 状态转换边覆盖 (StateAFL 风格)
+        // =============================================
+        RTPSState new_state = profile.inferred_state;
+        if (new_state != current_state_) {
+            // 状态转换边: from_state -> to_state
+            uint16_t edge = (static_cast<uint8_t>(current_state_) << 8) | 
+                           static_cast<uint8_t>(new_state);
+            
+            record_hit(0x4000 | edge);
+            
+            // 追踪新的状态转换
+            if (seen_state_edges_.insert(edge).second) {
+                new_state_edge_found_ = true;
+                new_coverage_found_ = true;
+            }
+            
+            current_state_ = new_state;
+        }
+        
+        // =============================================
+        // 6. RTPS Submessage 序列覆盖
+        // =============================================
+        if (!profile.submessage_ids.empty()) {
+            // 记录 submessage 序列的哈希
+            size_t seq_hash = 0;
+            for (uint8_t id : profile.submessage_ids) {
+                seq_hash = (seq_hash * 31) + id;
+            }
+            record_hit(0x8000 | (seq_hash % 0x1000));
+            
+            // 新的 submessage 组合
+            if (seen_submsg_sequences_.insert(seq_hash).second) {
+                new_coverage_found_ = true;
+            }
+        }
+        
+        // =============================================
+        // 7. 输入特征 -> 响应特征 关联 (AFL-Net 风格)
+        // =============================================
+        // 将输入的某些特征与响应关联，追踪因果关系
+        if (input.size() >= 20) {
+            uint8_t input_submsg_id = (input.size() > 20) ? input[20] : 0;
+            uint16_t input_response_pair = (input_submsg_id << 8) | 
+                                          static_cast<uint8_t>(profile.response_type);
+            record_hit(0xC000 | input_response_pair);
+        }
+        
+        // =============================================
+        // 8. 错误码覆盖
+        // =============================================
+        if (profile.error_code != 0) {
+            int error_bucket = categorize_error(profile.error_code);
+            record_hit(0xE000 | error_bucket);
+        }
+    }
+    
+    /**
+     * @brief 检查是否发现了新覆盖
+     */
+    bool has_new_coverage()
+    {
+        // 检查位图中的新覆盖
+        for (size_t i = 0; i < bitmap_.size(); ++i) {
+            if (bitmap_[i] > 0 && virgin_bitmap_[i] == 0) {
+                virgin_bitmap_[i] = 1;
+                new_coverage_found_ = true;
+            }
+        }
+        
+        bool result = new_coverage_found_;
+        return result;
+    }
+    
+    bool has_new_state_edge() const { return new_state_edge_found_; }
+    
+    void reset_current()
+    {
+        std::fill(bitmap_.begin(), bitmap_.end(), 0);
+    }
+    
+    RTPSState get_current_state() const { return current_state_; }
+    
+    void set_current_state(RTPSState state) { current_state_ = state; }
+    
+    // === 统计信息 ===
+    size_t get_bitmap_coverage() const
+    {
+        return std::count_if(virgin_bitmap_.begin(), virgin_bitmap_.end(),
+                            [](uint8_t v) { return v > 0; });
+    }
+    
+    size_t get_unique_responses() const { return unique_responses_; }
+    size_t get_state_edges() const { return seen_state_edges_.size(); }
+    size_t get_submsg_sequences() const { return seen_submsg_sequences_.size(); }
+    
+    double get_state_coverage_percent() const
+    {
+        // 理论最大状态转换数
+        size_t max_edges = STATE_COUNT * STATE_COUNT;
+        return 100.0 * seen_state_edges_.size() / max_edges;
+    }
+    
+    void print_stats() const
+    {
+        std::cout << "\n--- Response Coverage (AFL-Net/StateAFL style) ---" << std::endl;
+        std::cout << "  Bitmap coverage points: " << get_bitmap_coverage() << std::endl;
+        std::cout << "  Unique response patterns: " << unique_responses_ << std::endl;
+        std::cout << "  State transition edges: " << seen_state_edges_.size() 
+                  << " (" << std::fixed << std::setprecision(1) 
+                  << get_state_coverage_percent() << "%)" << std::endl;
+        std::cout << "  Submessage sequences: " << seen_submsg_sequences_.size() << std::endl;
+    }
+
+private:
+    std::vector<uint8_t> bitmap_;
+    std::vector<uint8_t> virgin_bitmap_;
+    
+    RTPSState current_state_;
+    
+    std::set<size_t> seen_response_hashes_;
+    std::set<uint16_t> seen_state_edges_;
+    std::set<size_t> seen_submsg_sequences_;
+    
+    size_t unique_responses_ = 0;
+    bool new_coverage_found_ = false;
+    bool new_state_edge_found_ = false;
+    
     void record_hit(size_t id)
     {
         size_t idx = id % bitmap_.size();
@@ -306,370 +580,549 @@ public:
         }
     }
     
-    /**
-     * @brief 记录完整的网络响应特征
-     * 
-     * 这是核心方法：将多维度的响应特征映射到覆盖率位图
-     */
-    void record_response(const NetworkResponseProfile& profile)
+    static int categorize_error(int error_code)
     {
-        // ========================================
-        // 1. 基本响应特征哈希（Boofuzz 风格）
-        // ========================================
-        size_t base_hash = compute_response_hash(profile);
-        record_hit(base_hash);
+        if (error_code == ECONNREFUSED) return 1;
+        if (error_code == EHOSTUNREACH) return 2;
+        if (error_code == ENETUNREACH) return 3;
+        if (error_code == ETIMEDOUT) return 4;
+        if (error_code == ENOBUFS) return 5;
+        if (error_code < 0) return 15;
+        return error_code % 16;
+    }
+};
+
+// ============================================================================
+// RTPS 网络注入器 (增强版 - 支持多端口多目标)
+// ============================================================================
+
+/**
+ * @brief 目标端点信息
+ */
+struct TargetEndpoint {
+    sockaddr_in addr;
+    int participant_id;
+    bool is_metatraffic;
+    std::string description;
+};
+
+/**
+ * @brief RTPS 网络注入器
+ * 
+ * 响应检测机制：
+ * 1. 主 socket：发送到目标端口，同时接收来自目标的响应
+ *    （UDP 发送后，响应会返回到源端口）
+ * 2. 多播监听 socket：加入 RTPS 发现多播组，监听目标的广播
+ *    （目标的 SPDP 心跳等会广播到多播地址）
+ * 3. 响应特征：响应时间、响应内容、是否有响应
+ * 
+ * 多目标支持：
+ * - 自动计算多个 MonitorNode 的端口
+ * - 同时向多个端点发送测试报文
+ * - 支持单播和多播两种模式
+ */
+class RTPSInjector {
+public:
+    RTPSInjector(const std::string& target_ip = "127.0.0.1", 
+                 int domain_id = 0,
+                 int num_participants = 1)
+        : target_ip_(target_ip)
+        , domain_id_(domain_id)
+        , num_participants_(num_participants)
+        , main_sock_(-1)
+        , multicast_sock_(-1)
+        , target_alive_(false)
+        , last_target_response_time_(std::chrono::steady_clock::now())
+    {
+    }
+    
+    ~RTPSInjector() { close(); }
+    
+    bool init()
+    {
+        // =============================================
+        // 1. 主 socket：发送 + 接收响应
+        // =============================================
+        main_sock_ = socket(AF_INET, SOCK_DGRAM, 0);
+        if (main_sock_ < 0) {
+            std::cerr << "Failed to create main socket: " << strerror(errno) << std::endl;
+            return false;
+        }
         
-        // ========================================
-        // 2. 状态转换边覆盖（StateAFL 风格）
-        // ========================================
-        // 记录状态转换边：from_state -> to_state
-        if (profile.state_changed) {
-            size_t from = static_cast<size_t>(profile.previous_state);
-            size_t to = static_cast<size_t>(profile.current_state);
-            size_t state_edge = (from << 4) | to;
-            record_hit(0x10000 | state_edge);
-            
-            // 记录新的状态转换
-            if (seen_state_transitions_.insert(state_edge).second) {
-                new_state_transition_ = true;
+        // 绑定到固定端口（模拟一个 RTPS 参与者）
+        // 使用 7500-7600 范围内的端口，避免与目标冲突
+        sockaddr_in local_addr = {};
+        local_addr.sin_family = AF_INET;
+        local_addr.sin_addr.s_addr = INADDR_ANY;
+        
+        bool bound = false;
+        for (int port = 7500; port < 7600; ++port) {
+            local_addr.sin_port = htons(port);
+            if (bind(main_sock_, reinterpret_cast<sockaddr*>(&local_addr), sizeof(local_addr)) >= 0) {
+                local_port_ = port;
+                bound = true;
+                break;
             }
         }
         
-        // ========================================
-        // 3. 响应时间分桶（AFL-Net 风格）
-        // ========================================
-        record_hit(0x20000 | profile.timing_bucket);
-        
-        // 时间异常检测
-        if (profile.timing_bucket >= 4) {  // 慢响应
-            record_hit(0x28000 | profile.timing_bucket);
+        if (!bound) {
+            // 如果固定端口都被占用，使用系统分配
+            local_addr.sin_port = 0;
+            if (bind(main_sock_, reinterpret_cast<sockaddr*>(&local_addr), sizeof(local_addr)) < 0) {
+                std::cerr << "Failed to bind main socket" << std::endl;
+                return false;
+            }
+            socklen_t len = sizeof(local_addr);
+            getsockname(main_sock_, reinterpret_cast<sockaddr*>(&local_addr), &len);
+            local_port_ = ntohs(local_addr.sin_port);
         }
         
-        // ========================================
-        // 4. 匹配状态变化（DDS 特定）
-        // ========================================
-        if (profile.matched_count_change != 0) {
-            // 匹配数量变化是重要的行为特征
-            int change_bucket = std::min(std::abs(profile.matched_count_change), 7);
-            int direction = profile.matched_count_change > 0 ? 1 : 0;
-            record_hit(0x30000 | (direction << 8) | change_bucket);
-        }
+        // 设置非阻塞
+        int flags = fcntl(main_sock_, F_GETFL, 0);
+        fcntl(main_sock_, F_SETFL, flags | O_NONBLOCK);
         
-        // ========================================
-        // 5. 错误码分类（重要的行为差异）
-        // ========================================
-        if (profile.error_code != 0) {
-            // 不同的错误码意味着不同的代码路径
-            record_hit(0x40000 | (profile.error_code & 0xFFFF));
+        // =============================================
+        // 2. 构建目标端点列表 (多 MonitorNode 支持)
+        // =============================================
+        build_target_endpoints();
+        
+        // =============================================
+        // 3. 多播监听 socket：监听 RTPS 发现广播
+        // =============================================
+        int spdp_multicast_port = calculate_rtps_port(domain_id_, 0, true, true);
+        int user_multicast_port = calculate_rtps_port(domain_id_, 0, false, true);
+        
+        multicast_sock_ = socket(AF_INET, SOCK_DGRAM, 0);
+        if (multicast_sock_ >= 0) {
+            // 允许地址重用
+            int reuse = 1;
+            setsockopt(multicast_sock_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+            setsockopt(multicast_sock_, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
             
-            // 按错误类型分类
-            int error_category = categorize_error(profile.error_code);
-            record_hit(0x48000 | error_category);
+            // 绑定到 SPDP 多播端口
+            sockaddr_in mcast_addr = {};
+            mcast_addr.sin_family = AF_INET;
+            mcast_addr.sin_addr.s_addr = INADDR_ANY;
+            mcast_addr.sin_port = htons(spdp_multicast_port);
+            
+            if (bind(multicast_sock_, reinterpret_cast<sockaddr*>(&mcast_addr), sizeof(mcast_addr)) >= 0) {
+                // 加入多播组
+                struct ip_mreq mreq = {};
+                inet_pton(AF_INET, RTPS_MULTICAST_ADDR, &mreq.imr_multiaddr);
+                mreq.imr_interface.s_addr = INADDR_ANY;
+                
+                if (setsockopt(multicast_sock_, IPPROTO_IP, IP_ADD_MEMBERSHIP, 
+                              &mreq, sizeof(mreq)) < 0) {
+                    std::cerr << "Warning: Failed to join multicast group" << std::endl;
+                }
+                
+                // 非阻塞
+                flags = fcntl(multicast_sock_, F_GETFL, 0);
+                fcntl(multicast_sock_, F_SETFL, flags | O_NONBLOCK);
+                
+                std::cout << "Multicast listener ready on " << RTPS_MULTICAST_ADDR 
+                          << ":" << spdp_multicast_port << std::endl;
+            } else {
+                std::cerr << "Warning: Failed to bind multicast socket" << std::endl;
+                ::close(multicast_sock_);
+                multicast_sock_ = -1;
+            }
         }
         
-        // ========================================
-        // 6. 异常行为（崩溃/挂起检测）
-        // ========================================
-        if (profile.connection_dropped) {
-            record_hit(0x50000);  // 连接断开（可能崩溃）
-        }
-        if (profile.timeout_occurred) {
-            record_hit(0x50001);  // 超时（可能挂起）
-        }
-        if (!profile.target_responsive) {
-            record_hit(0x50002);  // 目标无响应
-        }
+        // 多播发送地址 (用户数据多播)
+        memset(&multicast_user_addr_, 0, sizeof(multicast_user_addr_));
+        multicast_user_addr_.sin_family = AF_INET;
+        multicast_user_addr_.sin_port = htons(user_multicast_port);
+        inet_pton(AF_INET, RTPS_MULTICAST_ADDR, &multicast_user_addr_.sin_addr);
         
-        // ========================================
-        // 7. 响应内容哈希去重（如果需要）
-        // ========================================
-        size_t full_profile_hash = compute_full_hash(profile);
-        if (seen_response_hashes_.insert(full_profile_hash).second) {
-            new_unique_response_ = true;
-            unique_responses_count_++;
+        // SPDP 多播地址 (发现)
+        memset(&multicast_spdp_addr_, 0, sizeof(multicast_spdp_addr_));
+        multicast_spdp_addr_.sin_family = AF_INET;
+        multicast_spdp_addr_.sin_port = htons(spdp_multicast_port);
+        inet_pton(AF_INET, RTPS_MULTICAST_ADDR, &multicast_spdp_addr_.sin_addr);
+        
+        // 打印配置信息
+        std::cout << "\n========== RTPS Fuzzer Configuration ==========" << std::endl;
+        std::cout << "  Fuzzer listening on port: " << local_port_ << std::endl;
+        std::cout << "  Target IP: " << target_ip_ << std::endl;
+        std::cout << "  Domain ID: " << domain_id_ << std::endl;
+        std::cout << "  Number of participants: " << num_participants_ << std::endl;
+        std::cout << "\n  Target endpoints:" << std::endl;
+        for (const auto& ep : target_endpoints_) {
+            std::cout << "    - " << ep.description << std::endl;
+        }
+        std::cout << "\n  Multicast addresses:" << std::endl;
+        std::cout << "    - SPDP: " << RTPS_MULTICAST_ADDR << ":" << spdp_multicast_port << std::endl;
+        std::cout << "    - User: " << RTPS_MULTICAST_ADDR << ":" << user_multicast_port << std::endl;
+        std::cout << "================================================\n" << std::endl;
+        
+        return true;
+    }
+    
+    /**
+     * @brief 构建目标端点列表
+     * 
+     * 为每个 MonitorNode 计算正确的 RTPS 端口
+     */
+    void build_target_endpoints()
+    {
+        target_endpoints_.clear();
+        
+        for (int pid = 0; pid < num_participants_; ++pid) {
+            // Metatraffic 单播端口 (用于发现和控制消息)
+            int meta_port = calculate_rtps_port(domain_id_, pid, true, false);
+            TargetEndpoint meta_ep;
+            meta_ep.addr.sin_family = AF_INET;
+            meta_ep.addr.sin_port = htons(meta_port);
+            inet_pton(AF_INET, target_ip_.c_str(), &meta_ep.addr.sin_addr);
+            meta_ep.participant_id = pid;
+            meta_ep.is_metatraffic = true;
+            meta_ep.description = "Participant " + std::to_string(pid) + 
+                                 " metatraffic unicast :" + std::to_string(meta_port);
+            target_endpoints_.push_back(meta_ep);
+            
+            // 用户数据单播端口 (用于数据传输)
+            int user_port = calculate_rtps_port(domain_id_, pid, false, false);
+            TargetEndpoint user_ep;
+            user_ep.addr.sin_family = AF_INET;
+            user_ep.addr.sin_port = htons(user_port);
+            inet_pton(AF_INET, target_ip_.c_str(), &user_ep.addr.sin_addr);
+            user_ep.participant_id = pid;
+            user_ep.is_metatraffic = false;
+            user_ep.description = "Participant " + std::to_string(pid) + 
+                                 " user data unicast :" + std::to_string(user_port);
+            target_endpoints_.push_back(user_ep);
         }
     }
     
     /**
-     * @brief 兼容旧接口的方法
+     * @brief 发送并收集响应特征 (多端点版本)
+     * 
+     * 响应来源：
+     * 1. 直接响应：目标收到我们的包后，回复到我们的源端口
+     * 2. 多播响应：目标广播的 SPDP/SEDP 等发现消息
+     * 
+     * 发送策略：
+     * 1. 向所有目标端点发送测试报文
+     * 2. 同时发送到多播地址
+     * 
+     * 响应特征：
+     * 1. 有无响应：有响应说明目标活着且在处理
+     * 2. 响应时间：时间变化可能意味着不同的处理路径
+     * 3. 响应内容：不同的响应内容 = 不同的行为
      */
-    void record_response_features(
-        bool success,
-        size_t response_size,
-        int error_code)
+    NetworkResponseProfile inject_and_analyze(const std::vector<uint8_t>& data, 
+                                              int timeout_ms = RESPONSE_TIMEOUT_MS)
     {
         NetworkResponseProfile profile;
-        profile.write_result = success ? RETCODE_OK : RETCODE_ERROR;
-        profile.error_code = error_code;
-        profile.response_time_us = 0;
-        profile.timing_bucket = 0;
-        record_response(profile);
-    }
-    
-    /**
-     * @brief 检查是否发现了新覆盖
-     */
-    bool has_new_coverage()
-    {
-        bool new_coverage = false;
         
-        // 检查位图中的新覆盖点
-        for (size_t i = 0; i < bitmap_.size(); ++i) {
-            if (bitmap_[i] > 0 && virgin_bitmap_[i] == 0) {
-                virgin_bitmap_[i] = 1;
-                new_coverage = true;
+        if (main_sock_ < 0 || data.empty()) {
+            profile.response_type = ResponseType::SEND_ERROR;
+            return profile;
+        }
+        
+        auto start_time = std::chrono::steady_clock::now();
+        
+        // =============================================
+        // 1. 发送到所有目标端点 (单播)
+        // =============================================
+        int success_count = 0;
+        int send_errors = 0;
+        
+        for (const auto& endpoint : target_endpoints_) {
+            ssize_t sent = sendto(main_sock_, data.data(), data.size(), 0,
+                                 reinterpret_cast<const sockaddr*>(&endpoint.addr),
+                                 sizeof(endpoint.addr));
+            
+            if (sent > 0) {
+                success_count++;
+                packets_sent_++;
+            } else {
+                send_errors++;
+                if (errno == ECONNREFUSED) {
+                    // 某个端点拒绝连接
+                }
             }
         }
         
-        // 合并其他新发现
-        if (new_state_transition_) {
-            new_coverage = true;
-            new_state_transition_ = false;
-        }
-        if (new_unique_response_) {
-            new_coverage = true;
-            new_unique_response_ = false;
+        if (success_count == 0) {
+            profile.response_type = ResponseType::SEND_ERROR;
+            profile.error_code = errno;
+            if (errno == ECONNREFUSED) {
+                profile.inferred_state = RTPSState::TARGET_CRASHED;
+            }
+            return profile;
         }
         
-        return new_coverage;
-    }
-    
-    /**
-     * @brief 重置当前执行的覆盖
-     */
-    void reset_current()
-    {
-        std::fill(bitmap_.begin(), bitmap_.end(), 0);
-    }
-    
-    /**
-     * @brief 获取覆盖率统计
-     */
-    size_t get_covered_count() const
-    {
-        return std::count_if(virgin_bitmap_.begin(), virgin_bitmap_.end(),
-                            [](uint8_t v) { return v > 0; });
-    }
-    
-    /**
-     * @brief 获取状态转换覆盖率
-     */
-    double get_state_coverage() const
-    {
-        // 理论上最多 NUM_STATES * NUM_STATES 种转换
-        size_t max_transitions = STATE_COUNT * STATE_COUNT;
-        return static_cast<double>(seen_state_transitions_.size()) / max_transitions;
-    }
-    
-    /**
-     * @brief 获取唯一响应数量
-     */
-    size_t get_unique_responses() const
-    {
-        return unique_responses_count_;
-    }
-    
-    /**
-     * @brief 打印详细统计
-     */
-    void print_detailed_stats() const
-    {
-        std::cout << "\n--- Coverage Details ---" << std::endl;
-        std::cout << "  Bitmap coverage points: " << get_covered_count() << std::endl;
-        std::cout << "  State transitions seen: " << seen_state_transitions_.size() 
-                  << " (" << std::fixed << std::setprecision(1) 
-                  << (get_state_coverage() * 100) << "%)" << std::endl;
-        std::cout << "  Unique response patterns: " << unique_responses_count_ << std::endl;
-        std::cout << "  Unique response hashes: " << seen_response_hashes_.size() << std::endl;
+        profile.send_success = true;
         
-        // 多节点统计
-        if (!per_node_responses_.empty()) {
-            std::cout << "\n--- Per-Node Coverage ---" << std::endl;
-            for (const auto& pair : per_node_responses_) {
-                std::cout << "  Node " << pair.first.substr(0, 16) << "..."
-                          << " | unique responses: " << pair.second.size() << std::endl;
+        // 推断发送状态（基于我们发送的消息类型）
+        if (data.size() >= 21) {
+            uint8_t submsg_id = data[20];
+            switch (submsg_id) {
+                case 0x15: profile.inferred_state = RTPSState::SENT_DATA; break;
+                case 0x07: profile.inferred_state = RTPSState::SENT_HEARTBEAT; break;
+                case 0x06: profile.inferred_state = RTPSState::SENT_ACKNACK; break;
+                case 0x08: profile.inferred_state = RTPSState::SENT_GAP; break;
+                default: profile.inferred_state = RTPSState::SENT_DISCOVERY; break;
             }
         }
+        
+        // =============================================
+        // 2. 等待响应（来自主 socket 或多播 socket）
+        // =============================================
+        std::vector<uint8_t> recv_buffer(65536);
+        
+        // 准备 poll 的文件描述符
+        struct pollfd pfds[2];
+        int nfds = 0;
+        
+        pfds[nfds].fd = main_sock_;
+        pfds[nfds].events = POLLIN;
+        nfds++;
+        
+        if (multicast_sock_ >= 0) {
+            pfds[nfds].fd = multicast_sock_;
+            pfds[nfds].events = POLLIN;
+            nfds++;
+        }
+        
+        int poll_result = poll(pfds, nfds, timeout_ms);
+        
+        auto end_time = std::chrono::steady_clock::now();
+        profile.response_time_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            end_time - start_time).count();
+        profile.timing_bucket = NetworkResponseProfile::compute_timing_bucket(profile.response_time_us);
+        
+        if (poll_result > 0) {
+            // 检查主 socket 的响应（直接响应）
+            if (pfds[0].revents & POLLIN) {
+                sockaddr_in from_addr;
+                socklen_t from_len = sizeof(from_addr);
+                
+                ssize_t recv_len = recvfrom(main_sock_, recv_buffer.data(), recv_buffer.size(), 0,
+                                           reinterpret_cast<sockaddr*>(&from_addr), &from_len);
+                
+                if (recv_len > 0) {
+                    profile.response_size = recv_len;
+                    profile.inferred_state = RTPSState::GOT_RESPONSE;
+                    
+                    // 检查是否来自任一目标端点
+                    if (is_from_target(from_addr)) {
+                        target_alive_ = true;
+                        last_target_response_time_ = end_time;
+                        analyze_response(recv_buffer.data(), recv_len, profile);
+                    }
+                }
+            }
+            
+            // 检查多播 socket 的响应（发现广播）
+            if (nfds > 1 && (pfds[1].revents & POLLIN)) {
+                sockaddr_in from_addr;
+                socklen_t from_len = sizeof(from_addr);
+                
+                ssize_t recv_len = recvfrom(multicast_sock_, recv_buffer.data(), recv_buffer.size(), 0,
+                                           reinterpret_cast<sockaddr*>(&from_addr), &from_len);
+                
+                if (recv_len > 0) {
+                    // 检查是否来自目标
+                    if (is_from_target(from_addr)) {
+                        target_alive_ = true;
+                        last_target_response_time_ = end_time;
+                        multicast_responses_++;
+                        
+                        // 如果主 socket 没有收到响应，使用多播响应
+                        if (profile.response_size == 0) {
+                            profile.response_size = recv_len;
+                            profile.inferred_state = RTPSState::GOT_RESPONSE;
+                            analyze_response(recv_buffer.data(), recv_len, profile);
+                        }
+                    }
+                }
+            }
+        } else if (poll_result == 0) {
+            profile.response_type = ResponseType::TIMEOUT;
+            profile.inferred_state = RTPSState::TIMEOUT;
+            
+            // 检查目标是否长时间无响应（可能崩溃）
+            auto since_last = std::chrono::duration_cast<std::chrono::seconds>(
+                end_time - last_target_response_time_).count();
+            if (target_alive_ && since_last > 5) {
+                // 目标之前活着，但现在超过 5 秒无响应
+                profile.inferred_state = RTPSState::TARGET_CRASHED;
+                target_alive_ = false;
+            }
+        }
+        
+        return profile;
     }
     
-    // ========================================
-    // 多节点覆盖率追踪 (支持同时测试多个目标)
-    // ========================================
-    
     /**
-     * @brief 记录多节点响应特征
+     * @brief 发送到用户数据多播地址
      * 
-     * 当同时向多个节点发送模糊测试数据时，分别追踪每个节点的响应
+     * 用于向所有监听用户数据多播的 DataReader 发送测试报文
      */
-    void record_multi_node_response(
-        const std::vector<std::string>& disconnected_nodes,
-        const std::vector<std::string>& new_nodes,
-        size_t alive_count,
-        size_t total_count)
+    bool inject_to_user_multicast(const std::vector<uint8_t>& data)
     {
-        // 1. 记录节点连接变化（重要的行为特征）
-        for (const auto& node_id : disconnected_nodes) {
-            // 节点断开 = 可能崩溃
-            size_t node_hash = std::hash<std::string>{}(node_id);
-            record_hit(0x60000 | (node_hash % 0x1000));  // 节点断开事件
+        if (main_sock_ < 0 || data.empty()) return false;
+        
+        ssize_t sent = sendto(main_sock_, data.data(), data.size(), 0,
+                             reinterpret_cast<const sockaddr*>(&multicast_user_addr_),
+                             sizeof(multicast_user_addr_));
+        if (sent > 0) {
+            packets_sent_++;
+        }
+        return sent == static_cast<ssize_t>(data.size());
+    }
+    
+    /**
+     * @brief 发送到 SPDP 发现多播地址
+     * 
+     * 用于发送伪造的发现消息
+     */
+    bool inject_to_spdp_multicast(const std::vector<uint8_t>& data)
+    {
+        if (main_sock_ < 0 || data.empty()) return false;
+        
+        ssize_t sent = sendto(main_sock_, data.data(), data.size(), 0,
+                             reinterpret_cast<const sockaddr*>(&multicast_spdp_addr_),
+                             sizeof(multicast_spdp_addr_));
+        if (sent > 0) {
+            packets_sent_++;
+        }
+        return sent == static_cast<ssize_t>(data.size());
+    }
+    
+    /**
+     * @brief 发送到多播 (兼容旧接口)
+     */
+    bool inject_to_multicast(const std::vector<uint8_t>& data)
+    {
+        return inject_to_user_multicast(data);
+    }
+    
+    /**
+     * @brief 检查目标是否存活
+     */
+    bool is_target_alive() const { return target_alive_; }
+    
+    /**
+     * @brief 获取多播响应计数
+     */
+    size_t get_multicast_responses() const { return multicast_responses_; }
+    
+    /**
+     * @brief 获取总发送包数
+     */
+    size_t get_packets_sent() const { return packets_sent_; }
+    
+    /**
+     * @brief 获取目标端点数量
+     */
+    size_t get_endpoint_count() const { return target_endpoints_.size(); }
+    
+    void close()
+    {
+        if (main_sock_ >= 0) { ::close(main_sock_); main_sock_ = -1; }
+        if (multicast_sock_ >= 0) { 
+            // 离开多播组
+            struct ip_mreq mreq = {};
+            inet_pton(AF_INET, RTPS_MULTICAST_ADDR, &mreq.imr_multiaddr);
+            mreq.imr_interface.s_addr = INADDR_ANY;
+            setsockopt(multicast_sock_, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
             
-            // 标记此节点的状态转换
-            record_node_state_change(node_id, DDSProtocolState::DISCONNECTED);
-            
-            crashed_nodes_.insert(node_id);
+            ::close(multicast_sock_); 
+            multicast_sock_ = -1; 
         }
-        
-        for (const auto& node_id : new_nodes) {
-            size_t node_hash = std::hash<std::string>{}(node_id);
-            record_hit(0x68000 | (node_hash % 0x1000));  // 新节点连接事件
-        }
-        
-        // 2. 记录存活节点比例变化
-        int alive_bucket = static_cast<int>((alive_count * 10) / std::max(total_count, size_t(1)));
-        record_hit(0x70000 | alive_bucket);
     }
     
-    /**
-     * @brief 记录单个节点的响应（用于多节点场景）
-     */
-    void record_node_response(const std::string& node_id, const NetworkResponseProfile& profile)
+    std::string get_target_info() const
     {
-        // 1. 计算此节点的响应哈希
-        size_t node_hash = std::hash<std::string>{}(node_id);
-        size_t response_hash = compute_full_hash(profile);
-        size_t combined_hash = node_hash ^ response_hash;
-        
-        // 2. 检查此节点是否有新的响应模式
-        auto& node_responses = per_node_responses_[node_id];
-        if (node_responses.insert(response_hash).second) {
-            // 此节点发现新的响应模式
-            record_hit(0x78000 | (combined_hash % 0x8000));
-            new_unique_response_ = true;
-        }
-        
-        // 3. 记录此节点的状态转换
-        record_node_state_change(node_id, profile.current_state);
-    }
-    
-    /**
-     * @brief 获取已崩溃的节点
-     */
-    const std::set<std::string>& get_crashed_nodes() const
-    {
-        return crashed_nodes_;
-    }
-    
-    /**
-     * @brief 获取每节点覆盖率
-     */
-    size_t get_per_node_coverage(const std::string& node_id) const
-    {
-        auto it = per_node_responses_.find(node_id);
-        if (it != per_node_responses_.end()) {
-            return it->second.size();
-        }
-        return 0;
+        std::string info = target_ip_ + " domain=" + std::to_string(domain_id_) + 
+                          " participants=" + std::to_string(num_participants_) +
+                          " endpoints=" + std::to_string(target_endpoints_.size());
+        return info;
     }
 
 private:
-    std::vector<uint8_t> bitmap_;
-    std::vector<uint8_t> virgin_bitmap_;
+    std::string target_ip_;
+    int domain_id_;
+    int num_participants_;
+    int local_port_ = 0;
+    int main_sock_;           // 发送 + 接收直接响应
+    int multicast_sock_;      // 接收多播响应
     
-    // 状态追踪
-    DDSProtocolState last_state_;
-    int last_matched_count_;
+    // 目标端点列表
+    std::vector<TargetEndpoint> target_endpoints_;
     
-    // 去重集合
-    std::set<size_t> seen_response_hashes_;
-    std::set<size_t> seen_state_transitions_;
+    // 多播地址
+    sockaddr_in multicast_user_addr_;   // 用户数据多播
+    sockaddr_in multicast_spdp_addr_;   // SPDP 发现多播
     
-    // 新发现标记
-    bool new_state_transition_ = false;
-    bool new_unique_response_ = false;
-    size_t unique_responses_count_ = 0;
-    
-    // 多节点追踪
-    std::map<std::string, std::set<size_t>> per_node_responses_;      // 每节点的响应哈希集合
-    std::map<std::string, DDSProtocolState> per_node_states_;         // 每节点的当前状态
-    std::map<std::string, std::set<size_t>> per_node_state_edges_;    // 每节点的状态转换边
-    std::set<std::string> crashed_nodes_;                              // 已崩溃的节点
+    // 目标状态追踪
+    bool target_alive_;
+    std::chrono::steady_clock::time_point last_target_response_time_;
+    size_t multicast_responses_ = 0;
+    size_t packets_sent_ = 0;
     
     /**
-     * @brief 记录节点状态变化
+     * @brief 检查地址是否来自目标
      */
-    void record_node_state_change(const std::string& node_id, DDSProtocolState new_state)
+    bool is_from_target(const sockaddr_in& from_addr) const
     {
-        DDSProtocolState old_state = DDSProtocolState::INITIAL;
-        auto it = per_node_states_.find(node_id);
-        if (it != per_node_states_.end()) {
-            old_state = it->second;
-        }
-        
-        if (old_state != new_state) {
-            // 记录此节点的状态转换
-            size_t from = static_cast<size_t>(old_state);
-            size_t to = static_cast<size_t>(new_state);
-            size_t edge = (from << 4) | to;
-            
-            auto& node_edges = per_node_state_edges_[node_id];
-            if (node_edges.insert(edge).second) {
-                // 新的状态转换
-                new_state_transition_ = true;
+        // 检查 IP 地址是否匹配目标
+        for (const auto& ep : target_endpoints_) {
+            if (from_addr.sin_addr.s_addr == ep.addr.sin_addr.s_addr) {
+                return true;
             }
+        }
+        return false;
+    }
+    
+    /**
+     * @brief 分析响应内容，提取 RTPS 特征
+     */
+    void analyze_response(const uint8_t* data, size_t len, NetworkResponseProfile& profile)
+    {
+        // 计算响应哈希
+        profile.response_hash = compute_hash(data, len);
+        profile.response_prefix_hash = compute_hash(data, std::min(len, size_t(64)));
+        
+        // 检查是否是有效的 RTPS 响应
+        if (len >= 20 && data[0] == 'R' && data[1] == 'T' && data[2] == 'P' && data[3] == 'S') {
+            profile.is_valid_rtps = true;
+            profile.response_type = ResponseType::VALID_RTPS;
+            profile.rtps_version_major = data[4];
+            profile.rtps_version_minor = data[5];
+            profile.inferred_state = RTPSState::GOT_RTPS_RESPONSE;
             
-            per_node_states_[node_id] = new_state;
+            // 提取 submessage IDs
+            size_t offset = 20;
+            while (offset + 4 <= len) {
+                uint8_t submsg_id = data[offset];
+                profile.submessage_ids.push_back(submsg_id);
+                
+                uint16_t submsg_len = *reinterpret_cast<const uint16_t*>(&data[offset + 2]);
+                offset += 4 + submsg_len;
+                
+                if (profile.submessage_ids.size() > 16) break;  // 防止无限循环
+            }
+        } else {
+            profile.response_type = ResponseType::INVALID_RTPS;
+            profile.inferred_state = RTPSState::GOT_ERROR_RESPONSE;
         }
     }
     
-    /**
-     * @brief 计算响应特征的快速哈希
-     */
-    size_t compute_response_hash(const NetworkResponseProfile& profile) const
+    static size_t compute_hash(const uint8_t* data, size_t len)
     {
-        size_t h = 0;
-        h ^= static_cast<size_t>(profile.write_result) * 2654435761;
-        h ^= static_cast<size_t>(profile.timing_bucket) << 8;
-        h ^= static_cast<size_t>(profile.matched_count) << 12;
-        h ^= static_cast<size_t>(profile.error_code) << 16;
-        h ^= (profile.connection_dropped ? 1UL : 0UL) << 24;
-        h ^= (profile.timeout_occurred ? 1UL : 0UL) << 25;
-        return h % BITMAP_SIZE;
-    }
-    
-    /**
-     * @brief 计算完整响应的哈希（用于去重）
-     */
-    size_t compute_full_hash(const NetworkResponseProfile& profile) const
-    {
-        std::hash<size_t> hasher;
-        size_t h = 17;
-        h = h * 31 + hasher(static_cast<size_t>(profile.write_result));
-        h = h * 31 + hasher(static_cast<size_t>(profile.timing_bucket));
-        h = h * 31 + hasher(static_cast<size_t>(profile.matched_count));
-        h = h * 31 + hasher(static_cast<size_t>(profile.current_state));
-        h = h * 31 + hasher(static_cast<size_t>(profile.error_code));
-        h = h * 31 + hasher(profile.connection_dropped ? 1 : 0);
-        h = h * 31 + hasher(profile.timeout_occurred ? 1 : 0);
-        return h;
-    }
-    
-    /**
-     * @brief 错误码分类
-     */
-    int categorize_error(int error_code) const
-    {
-        // 将错误码映射到类别，便于追踪
-        if (error_code == 0) return 0;              // 无错误
-        if (error_code == static_cast<int>(RETCODE_ERROR)) return 1;
-        if (error_code == static_cast<int>(RETCODE_UNSUPPORTED)) return 2;
-        if (error_code == static_cast<int>(RETCODE_BAD_PARAMETER)) return 3;
-        if (error_code == static_cast<int>(RETCODE_PRECONDITION_NOT_MET)) return 4;
-        if (error_code == static_cast<int>(RETCODE_OUT_OF_RESOURCES)) return 5;
-        if (error_code == static_cast<int>(RETCODE_NOT_ENABLED)) return 6;
-        if (error_code == static_cast<int>(RETCODE_TIMEOUT)) return 7;
-        if (error_code == static_cast<int>(RETCODE_NO_DATA)) return 8;
-        if (error_code < 0) return 15;              // 系统错误
-        return 16;                                   // 未知错误
+        size_t hash = 0x811c9dc5;
+        for (size_t i = 0; i < len; ++i) {
+            hash ^= data[i];
+            hash *= 0x01000193;
+        }
+        return hash;
     }
 };
 
@@ -677,17 +1130,14 @@ private:
 // 高级模糊测试引擎
 // ============================================================================
 
-/**
- * @brief 高级模糊测试引擎
- */
 class AdvancedFuzzEngine {
 public:
     enum class Mode {
-        PROTOCOL_AWARE,     // 协议感知模式
-        MUTATION_BASED,     // 变异模式
-        GENERATION_BASED,   // 生成模式
-        ATTACK_PATTERNS,    // 攻击模式
-        HYBRID              // 混合模式
+        PROTOCOL_AWARE,
+        MUTATION_BASED,
+        GENERATION_BASED,
+        ATTACK_PATTERNS,
+        HYBRID
     };
     
     AdvancedFuzzEngine(uint64_t seed = 0)
@@ -695,352 +1145,169 @@ public:
         , protocol_fuzzer_(seed)
         , mode_(Mode::HYBRID)
         , iterations_(0)
-        , crashes_(0)
-        , hangs_(0)
     {
-        initialize_seed_corpus();
+        initialize_corpus();
     }
     
     void set_mode(Mode mode) { mode_ = mode; }
     
-    /**
-     * @brief 生成下一个测试用例
-     */
     std::vector<uint8_t> generate_testcase()
     {
         iterations_++;
         
         switch (mode_) {
-            case Mode::PROTOCOL_AWARE:
-                return generate_protocol_aware();
-            case Mode::MUTATION_BASED:
-                return generate_mutation_based();
-            case Mode::GENERATION_BASED:
-                return generate_generation_based();
-            case Mode::ATTACK_PATTERNS:
-                return generate_attack();
+            case Mode::PROTOCOL_AWARE: return generate_protocol_aware();
+            case Mode::MUTATION_BASED: return generate_mutation_based();
+            case Mode::GENERATION_BASED: return protocol_fuzzer_.generate_valid_message();
+            case Mode::ATTACK_PATTERNS: return protocol_fuzzer_.generate_dds_attack();
             case Mode::HYBRID:
-            default:
-                return generate_hybrid();
+            default: return generate_hybrid();
         }
     }
     
     /**
-     * @brief 处理测试结果（增强版 - 使用完整响应特征）
-     * 
-     * 这是网络模糊测试的核心：基于响应特征判断是否发现新行为
-     * 参考: AFL-Net, Boofuzz, StateAFL
+     * @brief 处理测试结果，更新覆盖率和种子能量
      */
-    void process_result(
-        const std::vector<uint8_t>& input,
-        const NetworkResponseProfile& profile)
+    void process_result(const std::vector<uint8_t>& input, const NetworkResponseProfile& profile)
     {
-        // 记录完整的响应特征
-        coverage_.record_response(profile);
+        // 记录响应到覆盖率追踪器
+        coverage_.record_response(profile, input);
         
-        // 检查新覆盖
         bool new_coverage = coverage_.has_new_coverage();
+        bool new_state_edge = coverage_.has_new_state_edge();
         
+        // 发现新覆盖 -> 添加到语料库
         if (new_coverage) {
-            // 发现新覆盖/新响应模式，保存到语料库
-            seed_queue_.add_seed(input);
-            new_findings_++;
-            
-            // 更新当前种子的能量
-            if (current_seed_) {
-                seed_queue_.update_energy(current_seed_, true);
-            }
-            
-            Logger::instance().log(LogLevel::DEBUG, "COVERAGE",
-                "New coverage found! Unique responses: " + 
-                std::to_string(coverage_.get_unique_responses()));
-        }
-        
-        // 检测崩溃
-        if (profile.is_crash || profile.connection_dropped) {
-            crashes_++;
-            save_crash(input);
-            Logger::instance().log(LogLevel::CRITICAL, "CRASH",
-                "Crash detected! Total crashes: " + std::to_string(crashes_));
-        }
-        
-        // 检测挂起
-        if (profile.is_hang || profile.timeout_occurred || 
-            profile.response_time_us > 5000000) {
-            hangs_++;
-            save_hang(input);
-            Logger::instance().log(LogLevel::WARNING, "HANG",
-                "Hang detected! Response time: " + 
-                std::to_string(profile.response_time_us / 1000) + "ms");
-        }
-        
-        // 重置覆盖率追踪
-        coverage_.reset_current();
-    }
-    
-    /**
-     * @brief 处理测试结果（多节点版本）
-     * 
-     * 支持同时向多个目标节点发送模糊测试数据
-     */
-    void process_result(
-        const std::vector<uint8_t>& input,
-        const NetworkResponseProfile& profile,
-        const std::vector<std::string>& disconnected_nodes,
-        const std::vector<std::string>& new_nodes,
-        size_t alive_count,
-        size_t total_count)
-    {
-        // 1. 记录基本响应特征
-        coverage_.record_response(profile);
-        
-        // 2. 记录多节点事件
-        coverage_.record_multi_node_response(disconnected_nodes, new_nodes, 
-                                             alive_count, total_count);
-        
-        // 3. 检查新覆盖
-        bool new_coverage = coverage_.has_new_coverage();
-        
-        if (new_coverage) {
-            seed_queue_.add_seed(input);
-            new_findings_++;
-            
-            if (current_seed_) {
-                seed_queue_.update_energy(current_seed_, true);
+            SeedEntry* new_seed = seed_queue_.add_seed(input, true);
+            if (new_seed) {
+                new_seed->last_state = profile.inferred_state;
+                new_findings_++;
             }
         }
         
-        // 4. 处理崩溃节点（每个断开的节点都可能是崩溃）
-        for (const auto& node_id : disconnected_nodes) {
-            node_crashes_++;
-            save_node_crash(input, node_id);
-            
-            Logger::instance().log(LogLevel::CRITICAL, "MULTI_CRASH",
-                "Node crash detected: " + node_id.substr(0, 16) + "...");
+        // 更新当前种子的能量
+        if (current_seed_) {
+            seed_queue_.update_seed(current_seed_, new_coverage, new_state_edge);
+            current_seed_->last_state = profile.inferred_state;
         }
         
-        // 5. 全局崩溃检测（所有节点都断开）
-        if (alive_count == 0 && total_count > 0) {
-            crashes_++;
-            save_crash(input);
-            Logger::instance().log(LogLevel::CRITICAL, "CRASH",
-                "All target nodes crashed!");
-        }
-        
-        // 6. 挂起检测
-        if (profile.is_hang || profile.timeout_occurred) {
+        // 检测崩溃/挂起
+        if (profile.timing_bucket >= 5) {
             hangs_++;
-            save_hang(input);
+            save_testcase(input, "hangs", "hang_" + std::to_string(hangs_));
         }
         
-        // 重置覆盖率追踪
+        if (profile.response_type == ResponseType::CONNECTION_REFUSED ||
+            profile.error_code == ECONNREFUSED) {
+            // 可能目标崩溃了
+            crashes_++;
+            save_testcase(input, "crashes", "crash_" + std::to_string(crashes_));
+        }
+        
         coverage_.reset_current();
     }
     
-    /**
-     * @brief 处理测试结果（兼容旧接口）
-     */
-    void process_result(
-        const std::vector<uint8_t>& input,
-        bool success,
-        int error_code,
-        uint64_t exec_time_us)
-    {
-        // 构建响应特征（从旧参数）
-        NetworkResponseProfile profile;
-        profile.write_result = success ? RETCODE_OK : RETCODE_ERROR;
-        profile.error_code = error_code;
-        profile.response_time_us = exec_time_us;
-        profile.timing_bucket = NetworkResponseProfile::compute_timing_bucket(exec_time_us);
-        profile.timeout_occurred = (exec_time_us > 5000000);
-        profile.connection_dropped = (!success && error_code == -1);
-        profile.is_crash = profile.connection_dropped;
-        profile.is_hang = profile.timeout_occurred;
-        
-        // 调用增强版
-        process_result(input, profile);
-    }
-    
-    /**
-     * @brief 打印统计信息
-     */
     void print_stats() const
     {
-        std::cout << "\n========== Advanced Fuzzer Statistics ==========" << std::endl;
+        std::cout << "\n==================== Fuzzer Statistics ====================" << std::endl;
         std::cout << "  Iterations: " << iterations_ << std::endl;
-        std::cout << "  Corpus size: " << seed_queue_.size() << std::endl;
-        std::cout << "  New findings: " << new_findings_ << std::endl;
-        std::cout << "  Crashes found: " << crashes_ << std::endl;
-        std::cout << "  Hangs found: " << hangs_ << std::endl;
+        std::cout << "  New findings (interesting inputs): " << new_findings_ << std::endl;
+        std::cout << "  Potential crashes: " << crashes_ << std::endl;
+        std::cout << "  Hangs/timeouts: " << hangs_ << std::endl;
         std::cout << "  Mode: " << mode_to_string(mode_) << std::endl;
-        std::cout << "\n--- Response Coverage (AFL-Net/Boofuzz style) ---" << std::endl;
-        std::cout << "  Bitmap coverage points: " << coverage_.get_covered_count() << std::endl;
-        std::cout << "  Unique response patterns: " << coverage_.get_unique_responses() << std::endl;
-        std::cout << "  State transition coverage: " << std::fixed << std::setprecision(1) 
-                  << (coverage_.get_state_coverage() * 100) << "%" << std::endl;
         
-        // 多节点统计
-        if (node_crashes_ > 0) {
-            std::cout << "\n--- Multi-Node Statistics ---" << std::endl;
-            std::cout << "  Individual node crashes: " << node_crashes_ << std::endl;
-            std::cout << "  Crashed nodes: " << coverage_.get_crashed_nodes().size() << std::endl;
-        }
-        std::cout << "=================================================" << std::endl;
+        std::cout << "\n--- Corpus ---" << std::endl;
+        seed_queue_.print_stats();
+        
+        coverage_.print_stats();
+        std::cout << "=============================================================" << std::endl;
     }
+    
+    void save_corpus(const std::string& dir)
+    {
+        seed_queue_.save_to_directory(dir);
+    }
+    
+    SeedEntry* get_current_seed() const { return current_seed_; }
 
 private:
     std::mt19937_64 rng_;
     dds_fuzzing::RTPSProtocolFuzzer protocol_fuzzer_;
     SeedQueue seed_queue_;
-    CoverageTracker coverage_;
+    ResponseCoverageTracker coverage_;
     Mode mode_;
     SeedEntry* current_seed_ = nullptr;
     
-    // 统计
-    uint64_t iterations_;
-    uint64_t crashes_;
-    uint64_t hangs_;
-    uint64_t new_findings_ = 0;    // 新发现的响应模式数
-    uint64_t node_crashes_ = 0;    // 单节点崩溃计数（多节点模式）
+    uint64_t iterations_ = 0;
+    uint64_t new_findings_ = 0;
+    uint64_t crashes_ = 0;
+    uint64_t hangs_ = 0;
     
-    void initialize_seed_corpus()
+    void initialize_corpus()
     {
-        // 添加一些初始种子
+        // 初始种子
+        seed_queue_.add_seed(protocol_fuzzer_.generate_valid_message(), false);
         
-        // 1. 有效的 RTPS 消息
-        seed_queue_.add_seed(protocol_fuzzer_.generate_valid_message());
-        
-        // 2. 最小有效消息（只有 header）
+        // 最小有效消息
         std::vector<uint8_t> minimal = {'R', 'T', 'P', 'S', 2, 3, 1, 15};
-        minimal.resize(20, 0);  // GUID prefix 填充 0
-        seed_queue_.add_seed(minimal);
+        minimal.resize(20, 0);
+        seed_queue_.add_seed(minimal, false);
         
-        // 3. 空 DATA 消息
-        auto data_msg = protocol_fuzzer_.generate_valid_message();
-        seed_queue_.add_seed(data_msg);
-        
-        // 4. 各种攻击模式的初始种子
+        // 各种攻击模式
         for (int i = 0; i < 5; ++i) {
-            seed_queue_.add_seed(protocol_fuzzer_.generate_dds_attack());
+            seed_queue_.add_seed(protocol_fuzzer_.generate_dds_attack(), false);
         }
+        
+        // 边界情况
+        std::vector<uint8_t> bad_magic = {0, 0, 0, 0, 2, 3, 1, 15};
+        bad_magic.resize(20, 0);
+        seed_queue_.add_seed(bad_magic, false);
     }
     
     std::vector<uint8_t> generate_protocol_aware()
     {
-        // 选择种子进行变异
         current_seed_ = seed_queue_.select_seed();
-        
         if (current_seed_) {
             return protocol_fuzzer_.mutate(current_seed_->data);
         }
-        
         return protocol_fuzzer_.generate_valid_message();
     }
     
     std::vector<uint8_t> generate_mutation_based()
     {
         current_seed_ = seed_queue_.select_seed();
-        
         if (!current_seed_) {
             return protocol_fuzzer_.generate_valid_message();
         }
         
-        // 多次变异
         std::vector<uint8_t> result = current_seed_->data;
         int mutations = 1 + (rng_() % 8);
-        
         for (int i = 0; i < mutations; ++i) {
             result = protocol_fuzzer_.mutate(result);
         }
-        
         return result;
-    }
-    
-    std::vector<uint8_t> generate_generation_based()
-    {
-        return protocol_fuzzer_.generate_valid_message();
-    }
-    
-    std::vector<uint8_t> generate_attack()
-    {
-        return protocol_fuzzer_.generate_dds_attack();
     }
     
     std::vector<uint8_t> generate_hybrid()
     {
-        // 混合模式：根据概率选择不同策略
         int r = rng_() % 100;
-        
-        if (r < 30) {
-            // 30%: 协议感知变异
-            return generate_protocol_aware();
-        } else if (r < 50) {
-            // 20%: 基本变异
-            return generate_mutation_based();
-        } else if (r < 70) {
-            // 20%: 生成
-            return generate_generation_based();
-        } else {
-            // 30%: 攻击模式
-            return generate_attack();
-        }
+        if (r < 40) return generate_protocol_aware();
+        if (r < 60) return generate_mutation_based();
+        if (r < 80) return protocol_fuzzer_.generate_valid_message();
+        return protocol_fuzzer_.generate_dds_attack();
     }
     
-    void save_crash(const std::vector<uint8_t>& input)
+    void save_testcase(const std::vector<uint8_t>& input, const std::string& subdir, 
+                      const std::string& name)
     {
-        // 创建目录（如果不存在）
-        system("mkdir -p output/crashes");
+        std::string dir = "output/" + subdir;
+        std::string mkdir_cmd = "mkdir -p " + dir;
+        system(mkdir_cmd.c_str());
         
-        std::string filename = "output/crashes/crash_" + std::to_string(crashes_) + ".bin";
+        std::string filename = dir + "/" + name + ".bin";
         std::ofstream file(filename, std::ios::binary);
         if (file) {
             file.write(reinterpret_cast<const char*>(input.data()), input.size());
-            Logger::instance().log(LogLevel::CRITICAL, "FUZZER", 
-                "Crash saved to: " + filename);
-        }
-    }
-    
-    void save_hang(const std::vector<uint8_t>& input)
-    {
-        // 创建目录（如果不存在）
-        system("mkdir -p output/hangs");
-        
-        std::string filename = "output/hangs/hang_" + std::to_string(hangs_) + ".bin";
-        std::ofstream file(filename, std::ios::binary);
-        if (file) {
-            file.write(reinterpret_cast<const char*>(input.data()), input.size());
-            Logger::instance().log(LogLevel::WARNING, "FUZZER", 
-                "Hang saved to: " + filename);
-        }
-    }
-    
-    /**
-     * @brief 保存导致特定节点崩溃的输入（多节点模式）
-     */
-    void save_node_crash(const std::vector<uint8_t>& input, const std::string& node_id)
-    {
-        // 创建目录（如果不存在）
-        system("mkdir -p output/node_crashes");
-        
-        // 使用节点ID的短哈希作为文件名的一部分
-        std::string short_id = node_id.substr(0, 8);
-        std::string filename = "output/node_crashes/node_" + short_id + 
-                               "_crash_" + std::to_string(node_crashes_) + ".bin";
-        std::ofstream file(filename, std::ios::binary);
-        if (file) {
-            file.write(reinterpret_cast<const char*>(input.data()), input.size());
-            Logger::instance().log(LogLevel::CRITICAL, "FUZZER", 
-                "Node crash saved to: " + filename);
-        }
-        
-        // 同时保存节点信息
-        std::string info_filename = "output/node_crashes/node_" + short_id + 
-                                    "_crash_" + std::to_string(node_crashes_) + ".info";
-        std::ofstream info_file(info_filename);
-        if (info_file) {
-            info_file << "Node ID: " << node_id << "\n";
-            info_file << "Crash number: " << node_crashes_ << "\n";
-            info_file << "Input size: " << input.size() << " bytes\n";
         }
     }
     
@@ -1058,633 +1325,118 @@ private:
 };
 
 // ============================================================================
-// 网络直接注入器
-// ============================================================================
-
-/**
- * @brief 直接向 RTPS 端口注入畸形数据包
- */
-class RTPSInjector {
-public:
-    RTPSInjector(const std::string& target_ip = "127.0.0.1", int port = RTPS_DEFAULT_PORT)
-        : target_ip_(target_ip)
-        , target_port_(port)
-        , sock_(-1)
-    {
-    }
-    
-    ~RTPSInjector()
-    {
-        close();
-    }
-    
-    bool init()
-    {
-        sock_ = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock_ < 0) {
-            Logger::instance().log(LogLevel::ERROR, "INJECTOR", 
-                "Failed to create socket");
-            return false;
-        }
-        
-        // 设置目标地址
-        memset(&target_addr_, 0, sizeof(target_addr_));
-        target_addr_.sin_family = AF_INET;
-        target_addr_.sin_port = htons(target_port_);
-        inet_pton(AF_INET, target_ip_.c_str(), &target_addr_.sin_addr);
-        
-        Logger::instance().log(LogLevel::INFO, "INJECTOR", 
-            "Initialized, target: " + target_ip_ + ":" + std::to_string(target_port_));
-        
-        return true;
-    }
-    
-    bool inject(const std::vector<uint8_t>& data)
-    {
-        if (sock_ < 0 || data.empty()) {
-            return false;
-        }
-        
-        ssize_t sent = sendto(sock_, data.data(), data.size(), 0,
-                             reinterpret_cast<const sockaddr*>(&target_addr_),
-                             sizeof(target_addr_));
-        
-        return sent == static_cast<ssize_t>(data.size());
-    }
-    
-    bool inject_to_multicast(const std::vector<uint8_t>& data)
-    {
-        // 向 DDS 发现多播地址发送
-        sockaddr_in mcast_addr;
-        memset(&mcast_addr, 0, sizeof(mcast_addr));
-        mcast_addr.sin_family = AF_INET;
-        mcast_addr.sin_port = htons(RTPS_MULTICAST_PORT);
-        inet_pton(AF_INET, "239.255.0.1", &mcast_addr.sin_addr);  // DDS 默认多播地址
-        
-        ssize_t sent = sendto(sock_, data.data(), data.size(), 0,
-                             reinterpret_cast<const sockaddr*>(&mcast_addr),
-                             sizeof(mcast_addr));
-        
-        return sent == static_cast<ssize_t>(data.size());
-    }
-    
-    void close()
-    {
-        if (sock_ >= 0) {
-            ::close(sock_);
-            sock_ = -1;
-        }
-    }
-
-private:
-    std::string target_ip_;
-    int target_port_;
-    int sock_;
-    sockaddr_in target_addr_;
-};
-
-// ============================================================================
-// 多节点响应追踪 (支持同时向多个目标节点发送模糊测试)
-// ============================================================================
-
-/**
- * @brief 单个目标节点的状态
- */
-struct TargetNodeState {
-    std::string node_id;                          // 节点标识（GUID 字符串）
-    DDSProtocolState protocol_state = DDSProtocolState::INITIAL;
-    bool is_alive = true;
-    uint64_t last_response_time_us = 0;
-    uint32_t message_count = 0;
-    uint32_t error_count = 0;
-    uint32_t timeout_count = 0;
-    std::chrono::steady_clock::time_point last_seen;
-    
-    TargetNodeState() : last_seen(std::chrono::steady_clock::now()) {}
-    explicit TargetNodeState(const std::string& id) 
-        : node_id(id), last_seen(std::chrono::steady_clock::now()) {}
-};
-
-/**
- * @brief 多节点响应特征
- */
-struct MultiNodeResponseProfile : public NetworkResponseProfile {
-    std::string target_node_id;                   // 目标节点 ID
-    std::vector<std::string> disconnected_nodes; // 本次断开的节点列表
-    std::vector<std::string> new_nodes;          // 本次新连接的节点列表
-    size_t total_targets = 0;                    // 总目标节点数
-    size_t alive_targets = 0;                    // 存活节点数
-};
-
-// ============================================================================
-// DataWriter Listener (增强版 - 支持多节点追踪)
-// ============================================================================
-
-class AdvancedFuzzerListener : public DataWriterListener
-{
-public:
-    AdvancedFuzzerListener() : matched_(0) {}
-    
-    void on_publication_matched(
-            DataWriter* /*writer*/,
-            const PublicationMatchedStatus& info) override
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        
-        // 从 info 获取订阅者的 GUID
-        std::string node_id = guid_to_string(info.last_subscription_handle);
-        
-        if (info.current_count_change == 1) {
-            // 新节点连接
-            matched_++;
-            TargetNodeState state(node_id);
-            state.is_alive = true;
-            state.protocol_state = DDSProtocolState::MATCHED;
-            node_states_[node_id] = state;
-            recent_new_nodes_.push_back(node_id);
-            
-            std::cout << "Subscriber matched! Node: " << node_id 
-                      << ", Total: " << matched_ << std::endl;
-                      
-            Logger::instance().log(LogLevel::INFO, "MULTI_NODE",
-                "New target node connected: " + node_id);
-                
-        } else if (info.current_count_change == -1) {
-            // 节点断开
-            matched_--;
-            if (node_states_.count(node_id) > 0) {
-                node_states_[node_id].is_alive = false;
-                node_states_[node_id].protocol_state = DDSProtocolState::DISCONNECTED;
-            }
-            recent_disconnected_nodes_.push_back(node_id);
-            
-            std::cout << "Subscriber disconnected! Node: " << node_id 
-                      << ", Total: " << matched_ << std::endl;
-                      
-            Logger::instance().log(LogLevel::WARNING, "MULTI_NODE",
-                "Target node disconnected: " + node_id + " (possible crash!)");
-        }
-    }
-    
-    int get_matched() const { return matched_.load(); }
-    
-    /**
-     * @brief 获取所有节点状态
-     */
-    std::map<std::string, TargetNodeState> get_node_states() const
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return node_states_;
-    }
-    
-    /**
-     * @brief 获取存活节点数
-     */
-    size_t get_alive_count() const
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        size_t count = 0;
-        for (const auto& pair : node_states_) {
-            if (pair.second.is_alive) count++;
-        }
-        return count;
-    }
-    
-    /**
-     * @brief 获取并清除最近断开的节点
-     */
-    std::vector<std::string> pop_disconnected_nodes()
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<std::string> result = std::move(recent_disconnected_nodes_);
-        recent_disconnected_nodes_.clear();
-        return result;
-    }
-    
-    /**
-     * @brief 获取并清除最近连接的节点
-     */
-    std::vector<std::string> pop_new_nodes()
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<std::string> result = std::move(recent_new_nodes_);
-        recent_new_nodes_.clear();
-        return result;
-    }
-    
-    /**
-     * @brief 更新节点的响应统计
-     */
-    void update_node_response(const std::string& node_id, uint64_t response_time_us, bool is_error)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (node_states_.count(node_id) > 0) {
-            auto& state = node_states_[node_id];
-            state.message_count++;
-            state.last_response_time_us = response_time_us;
-            state.last_seen = std::chrono::steady_clock::now();
-            if (is_error) {
-                state.error_count++;
-            }
-            if (response_time_us > 5000000) {
-                state.timeout_count++;
-            }
-        }
-    }
-    
-    /**
-     * @brief 检查并标记超时节点
-     */
-    std::vector<std::string> check_timeout_nodes(uint64_t timeout_ms = 10000)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::vector<std::string> timeout_nodes;
-        auto now = std::chrono::steady_clock::now();
-        
-        for (auto& pair : node_states_) {
-            if (pair.second.is_alive) {
-                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - pair.second.last_seen).count();
-                if (elapsed > static_cast<int64_t>(timeout_ms)) {
-                    pair.second.protocol_state = DDSProtocolState::TIMEOUT;
-                    timeout_nodes.push_back(pair.first);
-                }
-            }
-        }
-        return timeout_nodes;
-    }
-    
-    /**
-     * @brief 打印多节点统计
-     */
-    void print_node_stats() const
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        std::cout << "\n--- Multi-Node Statistics ---" << std::endl;
-        std::cout << "  Total nodes seen: " << node_states_.size() << std::endl;
-        std::cout << "  Currently alive: " << get_alive_count_unlocked() << std::endl;
-        
-        for (const auto& pair : node_states_) {
-            const auto& state = pair.second;
-            std::cout << "  Node " << pair.first.substr(0, 16) << "..."
-                      << " | alive: " << (state.is_alive ? "yes" : "NO")
-                      << " | msgs: " << state.message_count
-                      << " | errs: " << state.error_count
-                      << " | timeouts: " << state.timeout_count
-                      << std::endl;
-        }
-    }
-
-private:
-    std::atomic<int> matched_;
-    mutable std::mutex mutex_;
-    std::map<std::string, TargetNodeState> node_states_;
-    std::vector<std::string> recent_disconnected_nodes_;
-    std::vector<std::string> recent_new_nodes_;
-    
-    size_t get_alive_count_unlocked() const
-    {
-        size_t count = 0;
-        for (const auto& pair : node_states_) {
-            if (pair.second.is_alive) count++;
-        }
-        return count;
-    }
-    
-    static std::string guid_to_string(const eprosima::fastdds::rtps::InstanceHandle_t& handle)
-    {
-        std::stringstream ss;
-        ss << std::hex;
-        for (size_t i = 0; i < 16; ++i) {
-            ss << std::setw(2) << std::setfill('0') 
-               << static_cast<int>(handle.value[i]);
-        }
-        return ss.str();
-    }
-};
-
-// ============================================================================
-// 高级模糊测试节点
+// 模糊测试节点
 // ============================================================================
 
 class AdvancedFuzzerNode {
 public:
-    AdvancedFuzzerNode()
-        : participant_(nullptr)
-        , publisher_(nullptr)
-        , topic_(nullptr)
-        , writer_(nullptr)
-        , use_network_injection_(false)
+    /**
+     * @brief 构造函数
+     * 
+     * @param target_ip 目标 IP 地址
+     * @param domain_id DDS Domain ID (影响端口计算)
+     * @param num_participants 目标参与者数量 (如：3 个 MonitorNode)
+     */
+    AdvancedFuzzerNode(const std::string& target_ip = "127.0.0.1", 
+                       int domain_id = 0,
+                       int num_participants = 1)
+        : injector_(target_ip, domain_id, num_participants)
+        , domain_id_(domain_id)
+        , num_participants_(num_participants)
     {
     }
     
-    ~AdvancedFuzzerNode()
+    bool init()
     {
-        cleanup();
-    }
-    
-    bool init(bool use_injection = false)
-    {
-        use_network_injection_ = use_injection;
+        std::cout << "Initializing RTPS protocol fuzzer..." << std::endl;
         
-        Logger::instance().log(LogLevel::INFO, "ADV_FUZZER",
-            "Initializing advanced fuzzer node...");
-        
-        if (use_network_injection_) {
-            // 使用网络注入模式
-            if (!injector_.init()) {
-                return false;
-            }
-            Logger::instance().log(LogLevel::INFO, "ADV_FUZZER",
-                "Using network injection mode");
-            return true;
-        }
-        
-        // 使用 DDS API 模式
-        DomainParticipantQos pqos;
-        pqos.name("AdvancedFuzzerNode");
-        pqos.transport().use_builtin_transports = true;
-        pqos.transport().send_socket_buffer_size = 1048576;
-        pqos.transport().listen_socket_buffer_size = 1048576;
-        
-        participant_ = DomainParticipantFactory::get_instance()->create_participant(
-            TEST_DOMAIN_ID, pqos);
-        
-        if (participant_ == nullptr) {
-            Logger::instance().log(LogLevel::ERROR, "ADV_FUZZER",
-                "Failed to create DomainParticipant");
+        if (!injector_.init()) {
+            std::cerr << "Failed to initialize network injector" << std::endl;
             return false;
         }
         
-        TypeSupport type(new SimpleTestMessagePubSubType());
-        type.register_type(participant_);
-        
-        topic_ = participant_->create_topic(
-            SIMPLE_TOPIC_NAME,
-            type.get_type_name(),
-            TOPIC_QOS_DEFAULT);
-        
-        if (topic_ == nullptr) {
-            Logger::instance().log(LogLevel::ERROR, "ADV_FUZZER",
-                "Failed to create Topic");
-            return false;
-        }
-        
-        publisher_ = participant_->create_publisher(PUBLISHER_QOS_DEFAULT);
-        if (publisher_ == nullptr) {
-            Logger::instance().log(LogLevel::ERROR, "ADV_FUZZER",
-                "Failed to create Publisher");
-            return false;
-        }
-        
-        DataWriterQos wqos = DATAWRITER_QOS_DEFAULT;
-        wqos.reliability().kind = BEST_EFFORT_RELIABILITY_QOS;
-        wqos.durability().kind = VOLATILE_DURABILITY_QOS;
-        wqos.history().kind = KEEP_LAST_HISTORY_QOS;
-        wqos.history().depth = 1;
-        
-        writer_ = publisher_->create_datawriter(topic_, wqos, &listener_);
-        if (writer_ == nullptr) {
-            Logger::instance().log(LogLevel::ERROR, "ADV_FUZZER",
-                "Failed to create DataWriter");
-            return false;
-        }
-        
-        Logger::instance().log(LogLevel::INFO, "ADV_FUZZER",
-            "Advanced fuzzer node initialized successfully");
+        std::cout << "Target: " << injector_.get_target_info() << std::endl;
         return true;
     }
     
-    void run(uint32_t iterations = 10000, uint32_t interval_ms = 50)
+    void run(uint32_t iterations = 10000, uint32_t interval_ms = 10)
     {
-        Logger::instance().log(LogLevel::INFO, "ADV_FUZZER",
-            "Starting advanced fuzzing test with " + std::to_string(iterations) + " iterations");
-        
-        // 等待订阅者（如果使用 DDS 模式）
-        if (!use_network_injection_) {
-            std::cout << "Waiting for subscribers to match..." << std::endl;
-            std::cout.flush();
-            
-            int wait_count = 0;
-            while (listener_.get_matched() == 0 && !SignalHandler::should_stop()) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                wait_count++;
-                if (wait_count % 5 == 0) {
-                    std::cout << "Still waiting for subscribers... (" << wait_count << "s)" << std::endl;
-                    std::cout.flush();
-                }
-                if (wait_count > 30) {
-                    std::cout << "Warning: No subscribers found after 30 seconds, continuing anyway..." << std::endl;
-                    break;
-                }
-            }
-            
-            if (listener_.get_matched() > 0) {
-                std::cout << "Found " << listener_.get_matched() << " subscriber(s), starting to send messages..." << std::endl;
-            }
-            std::cout.flush();
-        }
-        
-        uint32_t sent = 0;
-        uint32_t failed = 0;
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "  RTPS Protocol Fuzzer" << std::endl;
+        std::cout << "  Target: " << injector_.get_target_info() << std::endl;
+        std::cout << "  Iterations: " << iterations << std::endl;
+        std::cout << "  Target endpoints: " << injector_.get_endpoint_count() << std::endl;
+        std::cout << "========================================\n" << std::endl;
         
         auto start_time = std::chrono::steady_clock::now();
         
-        std::cout << "Entering main loop..." << std::endl;
-        std::cout.flush();
+        uint32_t sent = 0, responses = 0, timeouts = 0;
         
         for (uint32_t i = 0; i < iterations && !SignalHandler::should_stop(); ++i) {
-            if (i % 100 == 0) {
-                std::cout << "Iteration " << i << "..." << std::endl;
-                std::cout.flush();
-            }
-            
-            auto iter_start = std::chrono::steady_clock::now();
-            
             // 生成测试用例
-            std::vector<uint8_t> testcase;
-            try {
-                testcase = engine_.generate_testcase();
-            } catch (const std::exception& e) {
-                std::cerr << "Exception in generate_testcase: " << e.what() << std::endl;
-                continue;
-            } catch (...) {
-                std::cerr << "Unknown exception in generate_testcase" << std::endl;
-                continue;
-            }
+            std::vector<uint8_t> testcase = engine_.generate_testcase();
+            if (testcase.empty()) continue;
             
-            if (testcase.empty()) {
-                std::cerr << "Warning: empty testcase at iteration " << i << std::endl;
-            }
+            // 发送并分析响应 (会发送到所有目标端点)
+            NetworkResponseProfile profile = injector_.inject_and_analyze(testcase);
             
-            // ================================================
-            // 收集响应特征（AFL-Net / Boofuzz 风格）
-            // ================================================
-            NetworkResponseProfile profile;
-            int prev_matched = listener_.get_matched();
+            // 统计
+            if (profile.send_success) sent++;
+            if (profile.response_type == ResponseType::VALID_RTPS) responses++;
+            if (profile.response_type == ResponseType::TIMEOUT) timeouts++;
             
-            if (use_network_injection_) {
-                // 网络注入模式
-                bool success = injector_.inject(testcase);
-                profile.write_result = success ? RETCODE_OK : RETCODE_ERROR;
-                
-                // 也注入到多播地址
-                if (i % 10 == 0) {
-                    injector_.inject_to_multicast(testcase);
-                }
-            } else {
-                // DDS API 模式 - 需要将 testcase 转换为消息
-                SimpleTestMessage msg;
-                msg.seq_num(i);
-                
-                // 将 testcase 的一部分用作消息内容
-                if (!testcase.empty()) {
-                    size_t content_len = std::min(testcase.size(), size_t(1000));
-                    std::string content(reinterpret_cast<const char*>(testcase.data()), content_len);
-                    msg.message(content);
-                    msg.data_type(testcase[0]);
+            // 处理结果（更新覆盖率和种子能量）
+            engine_.process_result(testcase, profile);
+            
+            // 每 10 次发送多播 (覆盖所有监听多播的端点)
+            if (i % 10 == 0) {
+                // 交替发送用户数据多播和 SPDP 发现多播
+                if (i % 20 == 0) {
+                    injector_.inject_to_user_multicast(testcase);
                 } else {
-                    msg.message("empty testcase");
-                    msg.data_type(0);
-                }
-                
-                ReturnCode_t ret = writer_->write(&msg);
-                profile.write_result = ret;
-                profile.error_code = (ret == RETCODE_OK) ? 0 : static_cast<int>(ret);
-            }
-            
-            auto iter_end = std::chrono::steady_clock::now();
-            uint64_t exec_time = std::chrono::duration_cast<std::chrono::microseconds>(
-                iter_end - iter_start).count();
-            
-            // ================================================
-            // 填充响应特征（网络模糊测试的关键指标）
-            // ================================================
-            
-            // 时间特征
-            profile.response_time_us = exec_time;
-            profile.timing_bucket = NetworkResponseProfile::compute_timing_bucket(exec_time);
-            profile.timeout_occurred = (exec_time > 5000000);  // > 5s
-            
-            // 匹配状态变化（重要！连接断开可能意味着崩溃）
-            int curr_matched = listener_.get_matched();
-            profile.matched_count = curr_matched;
-            profile.matched_count_change = curr_matched - prev_matched;
-            profile.publication_matched_changed = (profile.matched_count_change != 0);
-            
-            // ================================================
-            // 多节点追踪（支持同时测试多个目标节点）
-            // ================================================
-            auto disconnected_nodes = listener_.pop_disconnected_nodes();
-            auto new_nodes = listener_.pop_new_nodes();
-            
-            // 记录多节点事件
-            if (!disconnected_nodes.empty()) {
-                for (const auto& node_id : disconnected_nodes) {
-                    Logger::instance().log(LogLevel::CRITICAL, "MULTI_NODE",
-                        "Node " + node_id.substr(0, 16) + "... disconnected during fuzzing!");
-                    node_crash_count_++;
+                    injector_.inject_to_spdp_multicast(testcase);
                 }
             }
             
-            // 连接状态（StateAFL 风格的状态追踪）
-            profile.connection_alive = (curr_matched > 0);
-            profile.connection_dropped = !disconnected_nodes.empty();  // 有任何节点断开
-            profile.target_responsive = !profile.timeout_occurred;
-            
-            // 协议状态推断
-            profile.previous_state = current_protocol_state_;
-            if (profile.connection_dropped) {
-                current_protocol_state_ = DDSProtocolState::DISCONNECTED;
-            } else if (profile.timeout_occurred) {
-                current_protocol_state_ = DDSProtocolState::TIMEOUT;
-            } else if (profile.error_code != 0) {
-                current_protocol_state_ = DDSProtocolState::ERROR_STATE;
-            } else if (curr_matched > 0) {
-                current_protocol_state_ = DDSProtocolState::COMMUNICATING;
-            } else {
-                current_protocol_state_ = DDSProtocolState::DISCOVERING;
-            }
-            profile.current_state = current_protocol_state_;
-            profile.state_changed = (profile.current_state != profile.previous_state);
-            
-            // 崩溃/挂起检测
-            profile.is_crash = !disconnected_nodes.empty();
-            profile.is_hang = profile.timeout_occurred;
-            
-            // 处理结果（使用增强版响应特征）
-            engine_.process_result(testcase, profile, disconnected_nodes, new_nodes, 
-                                   listener_.get_alive_count(), listener_.get_matched());
-            
-            bool success = (profile.write_result == RETCODE_OK);
-            
-            if (success) {
-                sent++;
-            } else {
-                failed++;
-            }
-            
-            // 定期打印进度
+            // 进度输出
             if (i > 0 && i % 1000 == 0) {
                 auto now = std::chrono::steady_clock::now();
                 double elapsed = std::chrono::duration<double>(now - start_time).count();
-                double rate = i / elapsed;
-                
-                std::stringstream ss;
-                ss << "Progress: " << i << "/" << iterations 
-                   << " (" << static_cast<int>(rate) << " exec/s)"
-                   << ", sent: " << sent << ", failed: " << failed;
-                Logger::instance().log(LogLevel::INFO, "ADV_FUZZER", ss.str());
+                std::cout << "[" << i << "/" << iterations << "] "
+                          << std::fixed << std::setprecision(1) << (i / elapsed) << " exec/s"
+                          << ", packets: " << injector_.get_packets_sent()
+                          << ", responses: " << responses
+                          << ", timeouts: " << timeouts << std::endl;
             }
             
-            std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+            if (interval_ms > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+            }
         }
         
-        // 打印最终统计
+        // 最终统计
         auto end_time = std::chrono::steady_clock::now();
         double total_time = std::chrono::duration<double>(end_time - start_time).count();
         
-        std::stringstream ss;
-        ss << "Fuzzing completed in " << total_time << " seconds\n"
-           << "  Total iterations: " << sent + failed << "\n"
-           << "  Successful: " << sent << "\n"
-           << "  Failed: " << failed << "\n"
-           << "  Rate: " << (sent + failed) / total_time << " exec/s";
-        Logger::instance().log(LogLevel::INFO, "ADV_FUZZER", ss.str());
+        std::cout << "\n--- Execution Summary ---" << std::endl;
+        std::cout << "  Time: " << std::fixed << std::setprecision(2) << total_time << "s" << std::endl;
+        std::cout << "  Test cases: " << sent << " (" << (sent / total_time) << "/s)" << std::endl;
+        std::cout << "  Total packets sent: " << injector_.get_packets_sent() << std::endl;
+        std::cout << "  Responses: " << responses << std::endl;
+        std::cout << "  Multicast responses: " << injector_.get_multicast_responses() << std::endl;
+        std::cout << "  Timeouts: " << timeouts << std::endl;
         
         engine_.print_stats();
+        engine_.save_corpus("output/corpus");
     }
     
-    void set_mode(AdvancedFuzzEngine::Mode mode)
-    {
-        engine_.set_mode(mode);
-    }
+    void set_mode(AdvancedFuzzEngine::Mode mode) { engine_.set_mode(mode); }
 
 private:
-    void cleanup()
-    {
-        if (participant_ != nullptr) {
-            participant_->delete_contained_entities();
-            DomainParticipantFactory::get_instance()->delete_participant(participant_);
-        }
-        injector_.close();
-    }
-    
-    DomainParticipant* participant_;
-    Publisher* publisher_;
-    Topic* topic_;
-    DataWriter* writer_;
-    AdvancedFuzzerListener listener_;
-    
-    AdvancedFuzzEngine engine_;
     RTPSInjector injector_;
-    bool use_network_injection_;
-    
-    // 协议状态追踪（StateAFL 风格）
-    DDSProtocolState current_protocol_state_ = DDSProtocolState::INITIAL;
-    
-    // 多节点统计
-    uint32_t node_crash_count_ = 0;  // 累计节点崩溃次数
+    AdvancedFuzzEngine engine_;
+    int domain_id_;
+    int num_participants_;
 };
 
 // ============================================================================
@@ -1693,99 +1445,92 @@ private:
 
 void print_usage(const char* prog)
 {
-    std::cout << "Usage: " << prog << " [options]\n"
+    std::cout << "RTPS Protocol Fuzzer - Response-guided network fuzzing\n\n"
+              << "Based on AFL-Net/StateAFL/Boofuzz techniques:\n"
+              << "  - Response content hashing (Boofuzz style)\n"
+              << "  - Response timing buckets (AFL-Net style)\n"
+              << "  - Protocol state machine coverage (StateAFL style)\n"
+              << "  - Energy-based seed scheduling (AFL style)\n\n"
+              << "Usage: " << prog << " [options]\n\n"
               << "Options:\n"
-              << "  -n, --iterations N   Number of iterations (default: 10000)\n"
-              << "  -i, --interval MS    Interval in milliseconds (default: 50)\n"
-              << "  -m, --mode MODE      Fuzzing mode:\n"
-              << "                         protocol - Protocol-aware fuzzing\n"
-              << "                         mutation - Mutation-based fuzzing\n"
-              << "                         generation - Generation-based fuzzing\n"
-              << "                         attack - Attack pattern generation\n"
-              << "                         hybrid - Hybrid mode (default)\n"
-              << "  --inject             Use network injection mode\n"
-              << "  -t, --target IP      Target IP for injection (default: 127.0.0.1)\n"
-              << "  -p, --port PORT      Target port for injection (default: 7400)\n"
-              << "  -h, --help           Show this help message\n";
+              << "  -t, --target IP         Target IP (default: 127.0.0.1)\n"
+              << "  -d, --domain ID         DDS Domain ID (default: 0)\n"
+              << "  -P, --participants N    Number of target participants/MonitorNodes (default: 3)\n"
+              << "  -n, --iterations N      Iterations (default: 10000)\n"
+              << "  -i, --interval MS       Interval in ms (default: 10)\n"
+              << "  -m, --mode MODE         Mode: protocol/mutation/generation/attack/hybrid\n"
+              << "  -h, --help              Show this help\n\n"
+              << "Port calculation (RTPS 2.3 spec):\n"
+              << "  For Domain 0, the ports are:\n"
+              << "    SPDP Multicast:     7400\n"
+              << "    User Multicast:     7401\n"
+              << "    Participant 0:      7410 (meta), 7411 (user)\n"
+              << "    Participant 1:      7412 (meta), 7413 (user)\n"
+              << "    Participant 2:      7414 (meta), 7415 (user)\n\n"
+              << "Example:\n"
+              << "  " << prog << " -t 127.0.0.1 -d 0 -P 3 -n 10000\n"
+              << "  (Fuzz 3 MonitorNodes on domain 0)\n";
 }
 
 int main(int argc, char** argv)
 {
-    std::cout << "========================================" << std::endl;
-    std::cout << "  DDS Advanced Fuzzing Test" << std::endl;
-    std::cout << "========================================" << std::endl;
-    
-    // 默认参数
+    std::string target_ip = "127.0.0.1";
+    int domain_id = 0;
+    int num_participants = 3;  // 默认 3 个 MonitorNode
     uint32_t iterations = 10000;
-    uint32_t interval_ms = 50;
+    uint32_t interval_ms = 10;
     AdvancedFuzzEngine::Mode mode = AdvancedFuzzEngine::Mode::HYBRID;
-    bool use_injection = false;
     
-    // 简单的命令行解析
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         
         if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             return 0;
+        } else if ((arg == "-t" || arg == "--target") && i + 1 < argc) {
+            target_ip = argv[++i];
+        } else if ((arg == "-d" || arg == "--domain") && i + 1 < argc) {
+            domain_id = std::atoi(argv[++i]);
+        } else if ((arg == "-P" || arg == "--participants") && i + 1 < argc) {
+            num_participants = std::atoi(argv[++i]);
         } else if ((arg == "-n" || arg == "--iterations") && i + 1 < argc) {
             iterations = std::atoi(argv[++i]);
         } else if ((arg == "-i" || arg == "--interval") && i + 1 < argc) {
             interval_ms = std::atoi(argv[++i]);
         } else if ((arg == "-m" || arg == "--mode") && i + 1 < argc) {
-            std::string mode_str = argv[++i];
-            if (mode_str == "protocol") {
-                mode = AdvancedFuzzEngine::Mode::PROTOCOL_AWARE;
-            } else if (mode_str == "mutation") {
-                mode = AdvancedFuzzEngine::Mode::MUTATION_BASED;
-            } else if (mode_str == "generation") {
-                mode = AdvancedFuzzEngine::Mode::GENERATION_BASED;
-            } else if (mode_str == "attack") {
-                mode = AdvancedFuzzEngine::Mode::ATTACK_PATTERNS;
-            } else {
-                mode = AdvancedFuzzEngine::Mode::HYBRID;
-            }
-        } else if (arg == "--inject") {
-            use_injection = true;
+            std::string m = argv[++i];
+            if (m == "protocol") mode = AdvancedFuzzEngine::Mode::PROTOCOL_AWARE;
+            else if (m == "mutation") mode = AdvancedFuzzEngine::Mode::MUTATION_BASED;
+            else if (m == "generation") mode = AdvancedFuzzEngine::Mode::GENERATION_BASED;
+            else if (m == "attack") mode = AdvancedFuzzEngine::Mode::ATTACK_PATTERNS;
         }
     }
     
-    std::cout << "Configuration:" << std::endl;
-    std::cout << "  Iterations: " << iterations << std::endl;
-    std::cout << "  Interval: " << interval_ms << " ms" << std::endl;
-    std::cout << "  Mode: ";
-    switch (mode) {
-        case AdvancedFuzzEngine::Mode::PROTOCOL_AWARE: std::cout << "PROTOCOL_AWARE"; break;
-        case AdvancedFuzzEngine::Mode::MUTATION_BASED: std::cout << "MUTATION_BASED"; break;
-        case AdvancedFuzzEngine::Mode::GENERATION_BASED: std::cout << "GENERATION_BASED"; break;
-        case AdvancedFuzzEngine::Mode::ATTACK_PATTERNS: std::cout << "ATTACK_PATTERNS"; break;
-        default: std::cout << "HYBRID"; break;
+    // 打印端口信息
+    std::cout << "\n========== RTPS Port Configuration ==========" << std::endl;
+    std::cout << "Domain ID: " << domain_id << std::endl;
+    std::cout << "SPDP Multicast Port: " << calculate_rtps_port(domain_id, 0, true, true) << std::endl;
+    std::cout << "User Multicast Port: " << calculate_rtps_port(domain_id, 0, false, true) << std::endl;
+    std::cout << "\nTarget Participants (" << num_participants << "):" << std::endl;
+    for (int p = 0; p < num_participants; ++p) {
+        std::cout << "  Participant " << p << ": "
+                  << "meta=" << calculate_rtps_port(domain_id, p, true, false) << ", "
+                  << "user=" << calculate_rtps_port(domain_id, p, false, false) << std::endl;
     }
-    std::cout << std::endl;
-    std::cout << "  Injection mode: " << (use_injection ? "enabled" : "disabled") << std::endl;
+    std::cout << "=============================================\n" << std::endl;
     
-    // 创建必要的目录
     system("mkdir -p output/crashes output/hangs output/corpus");
     
-    // 设置日志文件
-    Logger::instance().set_log_file("output/advanced_fuzzer.log");
-    
-    // 设置信号处理
     SignalHandler::setup();
     
-    // 创建并运行高级模糊测试节点
-    AdvancedFuzzerNode node;
+    AdvancedFuzzerNode node(target_ip, domain_id, num_participants);
     node.set_mode(mode);
     
-    if (!node.init(use_injection)) {
-        std::cerr << "Failed to initialize advanced fuzzer node" << std::endl;
+    if (!node.init()) {
         return EXIT_FAILURE;
     }
     
     node.run(iterations, interval_ms);
     
-    Logger::instance().log(LogLevel::INFO, "MAIN",
-        "Advanced fuzzer node shutdown complete");
     return EXIT_SUCCESS;
 }
-
